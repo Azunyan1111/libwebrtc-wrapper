@@ -1,0 +1,9 @@
+[package]
+name = "libwebrtc-sys"
+version.workspace = true
+edition.workspace = true
+
+[build-dependencies]
+cc = { workspace = true }
+
+[dependencies]
