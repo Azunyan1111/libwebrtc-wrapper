@@ -47,6 +47,18 @@ typedef void (*OnIceConnectionStateChangeCallback)(
     int state  // PeerConnectionInterface::IceConnectionState
 );
 
+typedef void (*OnIceCandidateCallback)(
+    void* user_data,
+    const char* candidate,  // SDP formatted ICE candidate
+    const char* sdp_mid,
+    int sdp_mline_index
+);
+
+typedef void (*OnIceGatheringStateChangeCallback)(
+    void* user_data,
+    int state  // PeerConnectionInterface::IceGatheringState
+);
+
 // Factory functions
 WebrtcPeerConnectionFactory* webrtc_factory_create(void);
 void webrtc_factory_destroy(WebrtcPeerConnectionFactory* factory);
@@ -82,6 +94,18 @@ void webrtc_pc_set_on_ice_connection_state_change_callback(
     void* user_data
 );
 
+void webrtc_pc_set_on_ice_candidate_callback(
+    WebrtcPeerConnection* pc,
+    OnIceCandidateCallback callback,
+    void* user_data
+);
+
+void webrtc_pc_set_on_ice_gathering_state_change_callback(
+    WebrtcPeerConnection* pc,
+    OnIceGatheringStateChangeCallback callback,
+    void* user_data
+);
+
 // Video track functions
 void webrtc_video_track_set_frame_callback(
     WebrtcVideoTrack* track,
@@ -89,9 +113,24 @@ void webrtc_video_track_set_frame_callback(
     void* user_data
 );
 
-// Audio track functions
+// Audio track functions (deprecated - use pc callbacks instead)
 void webrtc_audio_track_set_frame_callback(
     WebrtcAudioTrack* track,
+    AudioFrameCallback callback,
+    void* user_data
+);
+
+// Frame callback registration on PeerConnection
+// These callbacks are invoked for all received tracks
+// Must be set BEFORE creating offer/answer to receive frames
+void webrtc_pc_set_video_frame_callback(
+    WebrtcPeerConnection* pc,
+    VideoFrameCallback callback,
+    void* user_data
+);
+
+void webrtc_pc_set_audio_frame_callback(
+    WebrtcPeerConnection* pc,
     AudioFrameCallback callback,
     void* user_data
 );

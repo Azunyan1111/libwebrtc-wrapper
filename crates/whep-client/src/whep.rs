@@ -5,9 +5,18 @@ use libwebrtc_sys::*;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use tracing::{debug, info, warn};
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::mpsc::{self, Receiver, Sender};
+use tracing::{debug, info, trace, warn};
+use url::Url;
+
+/// ICE candidate information for trickle ICE
+#[derive(Debug, Clone)]
+pub struct IceCandidate {
+    pub candidate: String,
+    pub sdp_mid: String,
+    pub sdp_mline_index: i32,
+}
 
 /// WHEP Client for receiving WebRTC streams
 pub struct WhepClient {
@@ -17,15 +26,24 @@ pub struct WhepClient {
     peer_connection: *mut WebrtcPeerConnection,
     resource_url: Option<String>,
     callback_context: Option<Box<CallbackContext>>,
+    ice_candidate_rx: Option<Receiver<IceCandidate>>,
+    end_of_candidates_sent: bool,
 }
 
-struct CallbackContext {
-    video_frame_count: AtomicU64,
-    audio_frame_count: AtomicU64,
+use std::sync::atomic::Ordering;
+
+/// Context for frame counting and statistics.
+/// Passed to C callbacks as user_data pointer.
+pub struct CallbackContext {
+    pub video_frame_count: AtomicU64,
+    pub audio_frame_count: AtomicU64,
+    pub ice_gathering_complete: AtomicBool,
+    pub ice_candidate_tx: Sender<IceCandidate>,
 }
 
-// Safety: WhepClient manages raw pointers but ensures they are only used on the main thread
-unsafe impl Send for WhepClient {}
+// WhepClient intentionally does NOT implement Send.
+// libwebrtc raw pointers are not thread-safe and must remain on the thread they were created on.
+// Use #[tokio::main(flavor = "current_thread")] to ensure single-threaded execution.
 
 impl WhepClient {
     /// Create a new WHEP client
@@ -39,6 +57,8 @@ impl WhepClient {
             peer_connection: ptr::null_mut(),
             resource_url: None,
             callback_context: None,
+            ice_candidate_rx: None,
+            end_of_candidates_sent: false,
         })
     }
 
@@ -63,12 +83,16 @@ impl WhepClient {
         }
         self.peer_connection = pc;
 
-        // Set up callback context
+        // Set up callback context with ICE candidate channel
+        let (ice_tx, ice_rx) = mpsc::channel();
         let ctx = Box::new(CallbackContext {
             video_frame_count: AtomicU64::new(0),
             audio_frame_count: AtomicU64::new(0),
+            ice_gathering_complete: AtomicBool::new(false),
+            ice_candidate_tx: ice_tx,
         });
         self.callback_context = Some(ctx);
+        self.ice_candidate_rx = Some(ice_rx);
 
         // Set up callbacks
         self.setup_callbacks();
@@ -122,6 +146,11 @@ impl WhepClient {
     fn setup_callbacks(&mut self) {
         let pc = self.peer_connection;
 
+        // Get user_data pointer from callback_context
+        let user_data = self.callback_context.as_ref()
+            .map(|ctx| ctx.as_ref() as *const CallbackContext as *mut c_void)
+            .unwrap_or(ptr::null_mut());
+
         // Set on_track callback
         unsafe extern "C" fn on_track_callback(
             _user_data: *mut c_void,
@@ -153,22 +182,143 @@ impl WhepClient {
             info!("ICE connection state changed: {}", state_str);
         }
 
+        // Video frame callback - counts frames and logs periodically
+        unsafe extern "C" fn on_video_frame(
+            user_data: *mut c_void,
+            width: i32,
+            height: i32,
+            timestamp_us: i64,
+            _y_data: *const u8,
+            _y_stride: i32,
+            _u_data: *const u8,
+            _u_stride: i32,
+            _v_data: *const u8,
+            _v_stride: i32,
+        ) {
+            if user_data.is_null() {
+                return;
+            }
+            let ctx = &*(user_data as *const CallbackContext);
+            let count = ctx.video_frame_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+            // Log every 30 frames (approximately once per second at 30fps)
+            if count % 30 == 1 {
+                trace!(
+                    "Video frame #{}: {}x{} ts={}us",
+                    count, width, height, timestamp_us
+                );
+            }
+        }
+
+        // Audio frame callback - counts frames
+        unsafe extern "C" fn on_audio_frame(
+            user_data: *mut c_void,
+            sample_rate: i32,
+            num_channels: usize,
+            samples_per_channel: usize,
+            _data: *const i16,
+        ) {
+            if user_data.is_null() {
+                return;
+            }
+            let ctx = &*(user_data as *const CallbackContext);
+            let count = ctx.audio_frame_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+            // Log every 100 frames (approximately once per second at 48kHz/480 samples)
+            if count % 100 == 1 {
+                trace!(
+                    "Audio frame #{}: {}Hz {}ch {} samples",
+                    count, sample_rate, num_channels, samples_per_channel
+                );
+            }
+        }
+
+        // ICE candidate callback - sends candidates to channel for trickle ICE
+        unsafe extern "C" fn on_ice_candidate_callback(
+            user_data: *mut c_void,
+            candidate: *const std::os::raw::c_char,
+            sdp_mid: *const std::os::raw::c_char,
+            sdp_mline_index: std::os::raw::c_int,
+        ) {
+            if user_data.is_null() || candidate.is_null() {
+                return;
+            }
+            let ctx = &*(user_data as *const CallbackContext);
+            let candidate_str = CStr::from_ptr(candidate).to_string_lossy().to_string();
+            let sdp_mid_str = if sdp_mid.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(sdp_mid).to_string_lossy().to_string()
+            };
+
+            debug!(
+                "ICE candidate gathered: mid={} index={} candidate={}",
+                sdp_mid_str, sdp_mline_index, candidate_str
+            );
+
+            let ice_candidate = IceCandidate {
+                candidate: candidate_str,
+                sdp_mid: sdp_mid_str,
+                sdp_mline_index,
+            };
+
+            // Send to channel (ignore error if receiver dropped)
+            let _ = ctx.ice_candidate_tx.send(ice_candidate);
+        }
+
+        // ICE gathering state change callback
+        unsafe extern "C" fn on_ice_gathering_state_callback(
+            user_data: *mut c_void,
+            state: std::os::raw::c_int,
+        ) {
+            let state_str = match state {
+                0 => "New",
+                1 => "Gathering",
+                2 => "Complete",
+                _ => "Unknown",
+            };
+            info!("ICE gathering state changed: {}", state_str);
+
+            if !user_data.is_null() && state == 2 {
+                // Complete
+                let ctx = &*(user_data as *const CallbackContext);
+                ctx.ice_gathering_complete.store(true, Ordering::SeqCst);
+            }
+        }
+
         unsafe {
-            webrtc_pc_set_on_track_callback(pc, Some(on_track_callback), ptr::null_mut());
+            // Register frame callbacks BEFORE creating offer
+            webrtc_pc_set_video_frame_callback(pc, Some(on_video_frame), user_data);
+            webrtc_pc_set_audio_frame_callback(pc, Some(on_audio_frame), user_data);
+
+            webrtc_pc_set_on_track_callback(pc, Some(on_track_callback), user_data);
             webrtc_pc_set_on_ice_connection_state_change_callback(
                 pc,
                 Some(on_ice_state_callback),
-                ptr::null_mut(),
+                user_data,
+            );
+            webrtc_pc_set_on_ice_candidate_callback(
+                pc,
+                Some(on_ice_candidate_callback),
+                user_data,
+            );
+            webrtc_pc_set_on_ice_gathering_state_change_callback(
+                pc,
+                Some(on_ice_gathering_state_callback),
+                user_data,
             );
         }
     }
 
     /// Wait for connection and frames
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&mut self) -> Result<()> {
         info!("Waiting for connection...");
 
-        // Poll ICE connection state
+        // Poll ICE connection state and send trickle ICE candidates
         loop {
+            // Process any pending ICE candidates (trickle ICE)
+            self.process_ice_candidates().await;
+
             let state = unsafe { webrtc_pc_ice_connection_state(self.peer_connection) };
             match state {
                 2 | 3 => {
@@ -196,14 +346,149 @@ impl WhepClient {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
+            // Continue processing ICE candidates (may still arrive after connection)
+            self.process_ice_candidates().await;
+
+            // Check if ICE gathering is complete and send end-of-candidates
+            self.check_and_send_end_of_candidates().await;
+
             let state = unsafe { webrtc_pc_ice_connection_state(self.peer_connection) };
             if state == 4 || state == 6 {
                 // Failed or Closed
                 warn!("Connection lost (state={})", state);
                 break;
             }
+
+            // Log frame statistics
+            if let Some(ref ctx) = self.callback_context {
+                let video_count = ctx.video_frame_count.load(Ordering::Relaxed);
+                let audio_count = ctx.audio_frame_count.load(Ordering::Relaxed);
+                debug!("Frame stats: video={}, audio={}", video_count, audio_count);
+            }
         }
 
+        Ok(())
+    }
+
+    /// Process pending ICE candidates and send them via PATCH (trickle ICE)
+    async fn process_ice_candidates(&mut self) {
+        let candidates: Vec<IceCandidate> = if let Some(ref rx) = self.ice_candidate_rx {
+            rx.try_iter().collect()
+        } else {
+            return;
+        };
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        let resource_url = match &self.resource_url {
+            Some(url) => url.clone(),
+            None => {
+                warn!("Cannot send ICE candidates: resource URL not available");
+                return;
+            }
+        };
+
+        for candidate in candidates {
+            if let Err(e) = self.send_ice_candidate(&resource_url, &candidate).await {
+                warn!("Failed to send ICE candidate: {}", e);
+            }
+        }
+    }
+
+    /// Send a single ICE candidate to the WHEP resource URL via PATCH
+    async fn send_ice_candidate(&self, resource_url: &str, candidate: &IceCandidate) -> Result<()> {
+        // Format as SDP fragment per RFC 8840 / draft-ietf-wish-whip
+        // Include a=mid to identify the m-line for multiple media sections
+        let sdp_fragment = format!(
+            "a=mid:{}\r\na={}\r\n",
+            candidate.sdp_mid,
+            candidate.candidate
+        );
+
+        debug!(
+            "Sending ICE candidate to {}: mid={} index={}",
+            resource_url, candidate.sdp_mid, candidate.sdp_mline_index
+        );
+
+        let response = self
+            .http_client
+            .patch(resource_url)
+            .header("Content-Type", "application/trickle-ice-sdpfrag")
+            .body(sdp_fragment)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "PATCH request failed with status {}: {}",
+                status,
+                body
+            ));
+        }
+
+        debug!("ICE candidate sent successfully");
+        Ok(())
+    }
+
+    /// Check if ICE gathering is complete and send end-of-candidates if not already sent
+    async fn check_and_send_end_of_candidates(&mut self) {
+        if self.end_of_candidates_sent {
+            return;
+        }
+
+        let gathering_complete = self.callback_context.as_ref()
+            .map(|ctx| ctx.ice_gathering_complete.load(Ordering::SeqCst))
+            .unwrap_or(false);
+
+        if !gathering_complete {
+            return;
+        }
+
+        let resource_url = match &self.resource_url {
+            Some(url) => url.clone(),
+            None => {
+                warn!("Cannot send end-of-candidates: resource URL not available");
+                return;
+            }
+        };
+
+        if let Err(e) = self.send_end_of_candidates(&resource_url).await {
+            warn!("Failed to send end-of-candidates: {}", e);
+        } else {
+            self.end_of_candidates_sent = true;
+        }
+    }
+
+    /// Send end-of-candidates indication per RFC 8840
+    async fn send_end_of_candidates(&self, resource_url: &str) -> Result<()> {
+        // Per RFC 8840, a=end-of-candidates signals no more candidates
+        let sdp_fragment = "a=end-of-candidates\r\n";
+
+        info!("Sending end-of-candidates to {}", resource_url);
+
+        let response = self
+            .http_client
+            .patch(resource_url)
+            .header("Content-Type", "application/trickle-ice-sdpfrag")
+            .body(sdp_fragment)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "PATCH end-of-candidates failed with status {}: {}",
+                status,
+                body
+            ));
+        }
+
+        info!("end-of-candidates sent successfully");
         Ok(())
     }
 
@@ -229,16 +514,25 @@ impl WhepClient {
         }
 
         // Get resource URL from Location header
+        // Use Url::join for proper relative URL resolution per RFC 3986
         let resource_url = response
             .headers()
             .get("location")
             .and_then(|v| v.to_str().ok())
-            .map(|s| {
-                if s.starts_with("http") {
-                    s.to_string()
+            .map(|location| {
+                if location.starts_with("http://") || location.starts_with("https://") {
+                    // Absolute URL - use as-is
+                    location.to_string()
                 } else {
-                    // Relative URL - resolve against base
-                    format!("{}{}", self.whep_url.trim_end_matches("/webRTC/play"), s)
+                    // Relative URL - resolve against base WHEP URL
+                    Url::parse(&self.whep_url)
+                        .and_then(|base| base.join(location))
+                        .map(|u| u.to_string())
+                        .unwrap_or_else(|_| {
+                            // Fallback: simple concatenation
+                            warn!("Failed to parse base URL, using fallback concatenation");
+                            format!("{}/{}", self.whep_url.trim_end_matches('/'), location.trim_start_matches('/'))
+                        })
                 }
             });
 

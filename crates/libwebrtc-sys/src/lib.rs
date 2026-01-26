@@ -70,6 +70,22 @@ pub type OnIceConnectionStateChangeCallback = Option<
     ),
 >;
 
+pub type OnIceCandidateCallback = Option<
+    unsafe extern "C" fn(
+        user_data: *mut c_void,
+        candidate: *const c_char, // SDP formatted ICE candidate
+        sdp_mid: *const c_char,
+        sdp_mline_index: c_int,
+    ),
+>;
+
+pub type OnIceGatheringStateChangeCallback = Option<
+    unsafe extern "C" fn(
+        user_data: *mut c_void,
+        state: c_int, // PeerConnectionInterface::IceGatheringState
+    ),
+>;
+
 extern "C" {
     // Factory functions
     pub fn webrtc_factory_create() -> *mut WebrtcPeerConnectionFactory;
@@ -117,6 +133,16 @@ extern "C" {
         callback: OnIceConnectionStateChangeCallback,
         user_data: *mut c_void,
     );
+    pub fn webrtc_pc_set_on_ice_candidate_callback(
+        pc: *mut WebrtcPeerConnection,
+        callback: OnIceCandidateCallback,
+        user_data: *mut c_void,
+    );
+    pub fn webrtc_pc_set_on_ice_gathering_state_change_callback(
+        pc: *mut WebrtcPeerConnection,
+        callback: OnIceGatheringStateChangeCallback,
+        user_data: *mut c_void,
+    );
 
     // Video track functions
     pub fn webrtc_video_track_set_frame_callback(
@@ -125,9 +151,21 @@ extern "C" {
         user_data: *mut c_void,
     );
 
-    // Audio track functions
+    // Audio track functions (deprecated)
     pub fn webrtc_audio_track_set_frame_callback(
         track: *mut WebrtcAudioTrack,
+        callback: AudioFrameCallback,
+        user_data: *mut c_void,
+    );
+
+    // Frame callback registration on PeerConnection
+    pub fn webrtc_pc_set_video_frame_callback(
+        pc: *mut WebrtcPeerConnection,
+        callback: VideoFrameCallback,
+        user_data: *mut c_void,
+    );
+    pub fn webrtc_pc_set_audio_frame_callback(
+        pc: *mut WebrtcPeerConnection,
         callback: AudioFrameCallback,
         user_data: *mut c_void,
     );

@@ -139,52 +139,54 @@ VideoTrack  AudioTrack
 
 ## 4. ディレクトリ構造
 
+> **注記**: 以下は設計時点の構造です。現在の実装状況については各項目の注釈を参照してください。
+
 ```
 libwebrtc-wrapper/
 |-- Makefile                      # libwebrtc download
 |-- Cargo.toml                    # Workspace definition
 |-- deps/
 |   `-- webrtc/
-|       `-- macos_arm64/          # libwebrtc static library
+|       `-- macos_arm64/          # libwebrtc static library (libwebrtc.a)
+|           |-- include/          # C++ headers
+|           `-- lib/              # Static library
 |-- docs/
 |   |-- libwebrtc-packet-to-frame-flow.md
 |   |-- audio-rtp-to-audio-frame-implementation-guide.md
 |   |-- video-rtp-to-encoded-frame-implementation-guide.md
 |   `-- whep-whip-client-design.md  # This document
 `-- crates/
-    |-- libwebrtc-sys/            # Low-level FFI bindings
+    |-- libwebrtc-sys/            # Low-level FFI bindings [実装済み]
     |   |-- Cargo.toml
-    |   |-- build.rs              # bindgen, linker settings
+    |   |-- build.rs              # cc crate, linker settings
     |   |-- src/
-    |   |   `-- lib.rs            # bindgen generated code
+    |   |   `-- lib.rs            # Manual FFI bindings
     |   `-- wrapper/
     |       |-- wrapper.h         # C-compatible wrapper header
-    |       `-- wrapper.cpp       # C-compatible wrapper impl
-    |-- libwebrtc-rs/             # Safe Rust wrapper
-    |   |-- Cargo.toml
-    |   `-- src/
-    |       |-- lib.rs
-    |       |-- error.rs
-    |       |-- peer_connection.rs
-    |       |-- video_track.rs
-    |       |-- video_frame.rs
-    |       |-- audio_track.rs
-    |       `-- audio_frame.rs
-    |-- whep-cli/                 # WHEP client
+    |       |-- wrapper.cpp       # C-compatible wrapper impl
+    |       `-- include/
+    |           `-- __config_site # libc++ ABI override for __Cr namespace
+    |-- libwebrtc-rs/             # Safe Rust wrapper [未実装 - 将来対応]
+    |   `-- ...
+    |-- whep-client/              # WHEP client [実装済み - 基本機能]
     |   |-- Cargo.toml
     |   `-- src/
     |       |-- main.rs
-    |       |-- whep.rs           # WHEP HTTP client
-    |       |-- mkv_writer.rs     # MKV stream writer
-    |       `-- pipeline.rs       # Media pipeline
-    `-- whip-cli/                 # WHIP client
-        |-- Cargo.toml
-        `-- src/
-            |-- main.rs
-            |-- whip.rs           # WHIP HTTP client
-            |-- mkv_reader.rs     # MKV stream reader
-            `-- pipeline.rs       # Media pipeline
+    |       `-- whep.rs           # WHEP HTTP client + PeerConnection
+    |       # mkv_writer.rs       # [未実装 - TODO]
+    `-- whip-cli/                 # WHIP client [未実装 - 将来対応]
+        `-- ...
 ```
+
+### 4.1 現在の実装状況
+
+| コンポーネント | 状況 | 備考 |
+|--------------|------|------|
+| libwebrtc-sys | 実装済み | C++ラッパー、FFIバインディング |
+| libwebrtc-rs | 未実装 | 現在はlibwebrtc-sysを直接使用 |
+| whep-client | 基本機能済み | WHEP接続、ICE確立 |
+| MKV Writer | 未実装 | フレーム取得から実装予定 |
+| whip-cli | 未実装 | whep-cli完成後に着手予定 |
 
 ---
 
@@ -291,6 +293,10 @@ void webrtc_free_string(char* str);
 
 #### 5.1.3 build.rs
 
+> **注記**: 以下は実際の実装を反映した内容です。静的ライブラリ(libwebrtc.a)を使用し、
+> libc++ ABIの互換性問題（`std::__Cr::` vs `std::__1::`）を解決するために
+> カスタム`__config_site`を使用しています。
+
 ```rust
 // crates/libwebrtc-sys/build.rs
 use std::env;
@@ -298,49 +304,55 @@ use std::path::PathBuf;
 
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let webrtc_dir = PathBuf::from(&manifest_dir)
-        .join("../../deps/webrtc/macos_arm64");
+    let manifest_path = PathBuf::from(&manifest_dir);
+    let webrtc_dir = manifest_path
+        .join("../../deps/webrtc/macos_arm64")
+        .canonicalize()
+        .expect("WebRTC directory not found");
+
+    let include_dir = webrtc_dir.join("include");
+    let lib_dir = webrtc_dir.join("lib");
+
+    // Custom include directory with __config_site override
+    let custom_include = manifest_path.join("wrapper/include");
 
     // Compile wrapper.cpp
+    // libwebrtc.a uses libc++ with __Cr namespace (Chromium ABI).
+    // Our custom __config_site must come FIRST to override the system one.
     cc::Build::new()
         .cpp(true)
         .file("wrapper/wrapper.cpp")
-        .include(webrtc_dir.join("include"))
+        .flag(&format!("-isystem{}", custom_include.display()))
+        .include(&include_dir)
+        .include(include_dir.join("third_party/abseil-cpp"))
         .flag("-std=c++17")
         .flag("-stdlib=libc++")
+        .flag("-fno-rtti")
+        .define("WEBRTC_MAC", None)
+        .define("WEBRTC_POSIX", None)
         .compile("webrtc_wrapper");
 
-    // Link WebRTC.framework
-    println!(
-        "cargo:rustc-link-search=framework={}/Frameworks/WebRTC.xcframework/macos-arm64",
-        webrtc_dir.display()
-    );
-    println!("cargo:rustc-link-lib=framework=WebRTC");
+    // Link libwebrtc.a static library
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rustc-link-lib=static=webrtc");
 
-    // System frameworks
+    // System frameworks required by WebRTC
+    println!("cargo:rustc-link-lib=framework=Foundation");
     println!("cargo:rustc-link-lib=framework=CoreFoundation");
     println!("cargo:rustc-link-lib=framework=CoreMedia");
     println!("cargo:rustc-link-lib=framework=CoreVideo");
     println!("cargo:rustc-link-lib=framework=CoreAudio");
     println!("cargo:rustc-link-lib=framework=AudioToolbox");
     println!("cargo:rustc-link-lib=framework=VideoToolbox");
-    println!("cargo:rustc-link-lib=framework=Foundation");
+    // ... additional frameworks ...
     println!("cargo:rustc-link-lib=c++");
-
-    // Generate bindings
-    let bindings = bindgen::Builder::default()
-        .header("wrapper/wrapper.h")
-        .clang_arg(format!("-I{}", webrtc_dir.join("include").display()))
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
-        .generate()
-        .expect("Unable to generate bindings");
-
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings
-        .write_to_file(out_path.join("bindings.rs"))
-        .expect("Couldn't write bindings!");
 }
 ```
+
+**libc++ ABI互換性の解決**:
+libwebrtc.aはChromiumのlibc++でビルドされており、`std::__Cr::`名前空間を使用します。
+システムのlibc++は`std::__1::`を使用するため、リンク時に未解決シンボルエラーが発生します。
+この問題は`wrapper/include/__config_site`でABI名前空間を上書きすることで解決しています。
 
 ### 5.2 libwebrtc-rs（安全なRustラッパー）
 

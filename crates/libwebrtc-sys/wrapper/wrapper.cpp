@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 #include <condition_variable>
 
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
@@ -27,6 +28,7 @@
 #include "api/make_ref_counted.h"
 #include "api/audio/audio_device.h"
 #include "rtc_base/thread.h"
+#include "api/video/video_sink_interface.h"
 
 namespace {
 
@@ -39,8 +41,9 @@ char* strdup_wrapper(const std::string& s) {
     return result;
 }
 
-// Dummy AudioDeviceModule that doesn't play or record any audio
-// This prevents audio from being played through speakers
+// Dummy AudioDeviceModule that doesn't play or record any audio through speakers
+// This prevents audio from being played through speakers while still allowing
+// audio frames to be received via AudioTransport callback for future use.
 class DummyAudioDeviceModule : public webrtc::AudioDeviceModule {
 public:
     static webrtc::scoped_refptr<DummyAudioDeviceModule> Create() {
@@ -67,8 +70,19 @@ public:
         *audio_layer = AudioLayer::kDummyAudio;
         return 0;
     }
+
+    // Store the audio transport callback for potential future use
+    // (e.g., extracting decoded audio frames for MKV output)
     int32_t RegisterAudioCallback(webrtc::AudioTransport* callback) override {
+        std::lock_guard<std::mutex> lock(audio_transport_mutex_);
+        audio_transport_ = callback;
         return 0;
+    }
+
+    // Accessor for future audio frame extraction
+    webrtc::AudioTransport* GetAudioTransport() const {
+        std::lock_guard<std::mutex> lock(audio_transport_mutex_);
+        return audio_transport_;
     }
     int32_t Init() override { return 0; }
     int32_t Terminate() override { return 0; }
@@ -155,11 +169,13 @@ public:
     int32_t EnableBuiltInNS(bool) override { return -1; }
 
 protected:
-    DummyAudioDeviceModule() : ref_count_(0) {}
+    DummyAudioDeviceModule() : ref_count_(0), audio_transport_(nullptr) {}
     ~DummyAudioDeviceModule() override = default;
 
 private:
     mutable std::atomic<int> ref_count_;
+    mutable std::mutex audio_transport_mutex_;
+    webrtc::AudioTransport* audio_transport_;
 };
 
 // Global threads for libwebrtc
@@ -185,6 +201,80 @@ void EnsureThreads() {
     }
 }
 
+// VideoSink implementation for receiving decoded video frames
+class VideoSinkImpl : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
+public:
+    VideoSinkImpl(VideoFrameCallback callback, void* user_data)
+        : callback_(callback), user_data_(user_data) {}
+
+    void OnFrame(const webrtc::VideoFrame& frame) override {
+        if (!callback_) {
+            return;
+        }
+
+        // Get I420 buffer (convert if necessary)
+        webrtc::scoped_refptr<webrtc::I420BufferInterface> i420_buffer =
+            frame.video_frame_buffer()->ToI420();
+
+        if (!i420_buffer) {
+            return;
+        }
+
+        // Call the callback with frame data
+        callback_(
+            user_data_,
+            i420_buffer->width(),
+            i420_buffer->height(),
+            frame.timestamp_us(),
+            i420_buffer->DataY(),
+            i420_buffer->StrideY(),
+            i420_buffer->DataU(),
+            i420_buffer->StrideU(),
+            i420_buffer->DataV(),
+            i420_buffer->StrideV()
+        );
+    }
+
+private:
+    VideoFrameCallback callback_;
+    void* user_data_;
+};
+
+// AudioSink implementation for receiving decoded audio frames
+// Note: For audio, we use AudioTrackSinkInterface
+class AudioSinkImpl : public webrtc::AudioTrackSinkInterface {
+public:
+    AudioSinkImpl(AudioFrameCallback callback, void* user_data)
+        : callback_(callback), user_data_(user_data) {}
+
+    void OnData(const void* audio_data,
+                int bits_per_sample,
+                int sample_rate,
+                size_t number_of_channels,
+                size_t number_of_frames) override {
+        if (!callback_) {
+            return;
+        }
+
+        // libwebrtc delivers audio as interleaved 16-bit PCM
+        if (bits_per_sample != 16) {
+            return;
+        }
+
+        callback_(
+            user_data_,
+            sample_rate,
+            number_of_channels,
+            number_of_frames,
+            static_cast<const int16_t*>(audio_data)
+        );
+    }
+
+private:
+    AudioFrameCallback callback_;
+    void* user_data_;
+};
+
 }  // namespace
 
 // Opaque struct definitions
@@ -203,8 +293,8 @@ public:
     void OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> data_channel) override {}
     void OnRenegotiationNeeded() override {}
     void OnIceConnectionChange(webrtc::PeerConnectionInterface::IceConnectionState new_state) override;
-    void OnIceGatheringChange(webrtc::PeerConnectionInterface::IceGatheringState new_state) override {}
-    void OnIceCandidate(const webrtc::IceCandidateInterface* candidate) override {}
+    void OnIceGatheringChange(webrtc::PeerConnectionInterface::IceGatheringState new_state) override;
+    void OnIceCandidate(const webrtc::IceCandidateInterface* candidate) override;
     void OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) override;
 
 private:
@@ -220,6 +310,27 @@ struct WebrtcPeerConnection {
 
     OnIceConnectionStateChangeCallback on_ice_state_callback = nullptr;
     void* on_ice_state_user_data = nullptr;
+
+    OnIceCandidateCallback on_ice_candidate_callback = nullptr;
+    void* on_ice_candidate_user_data = nullptr;
+
+    OnIceGatheringStateChangeCallback on_ice_gathering_state_callback = nullptr;
+    void* on_ice_gathering_state_user_data = nullptr;
+
+    // Frame callbacks
+    VideoFrameCallback video_frame_callback = nullptr;
+    void* video_frame_user_data = nullptr;
+
+    AudioFrameCallback audio_frame_callback = nullptr;
+    void* audio_frame_user_data = nullptr;
+
+    // Track sinks (owned by PeerConnection, registered to tracks)
+    std::vector<std::unique_ptr<VideoSinkImpl>> video_sinks;
+    std::vector<std::unique_ptr<AudioSinkImpl>> audio_sinks;
+
+    // Keep track of registered tracks for cleanup
+    std::vector<webrtc::scoped_refptr<webrtc::VideoTrackInterface>> video_tracks;
+    std::vector<webrtc::scoped_refptr<webrtc::AudioTrackInterface>> audio_tracks;
 };
 
 // Observer implementations
@@ -235,14 +346,78 @@ void PeerConnectionObserverImpl::OnIceConnectionChange(
     }
 }
 
+void PeerConnectionObserverImpl::OnIceGatheringChange(
+    webrtc::PeerConnectionInterface::IceGatheringState new_state) {
+    if (pc_->on_ice_gathering_state_callback) {
+        pc_->on_ice_gathering_state_callback(
+            pc_->on_ice_gathering_state_user_data,
+            static_cast<int>(new_state));
+    }
+}
+
+void PeerConnectionObserverImpl::OnIceCandidate(
+    const webrtc::IceCandidateInterface* candidate) {
+    if (pc_->on_ice_candidate_callback && candidate) {
+        std::string sdp;
+        if (candidate->ToString(&sdp)) {
+            pc_->on_ice_candidate_callback(
+                pc_->on_ice_candidate_user_data,
+                sdp.c_str(),
+                candidate->sdp_mid().c_str(),
+                candidate->sdp_mline_index());
+        }
+    }
+}
+
 void PeerConnectionObserverImpl::OnTrack(
     webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver) {
-    if (pc_->on_track_callback && transceiver->receiver()) {
-        auto track = transceiver->receiver()->track();
-        if (track) {
-            std::string track_id = track->id();
-            int is_video = (track->kind() == webrtc::MediaStreamTrackInterface::kVideoKind) ? 1 : 0;
-            pc_->on_track_callback(pc_->on_track_user_data, track_id.c_str(), is_video);
+    if (!transceiver->receiver()) {
+        return;
+    }
+
+    auto track = transceiver->receiver()->track();
+    if (!track) {
+        return;
+    }
+
+    std::string track_id = track->id();
+    bool is_video = (track->kind() == webrtc::MediaStreamTrackInterface::kVideoKind);
+
+    // Call the on_track callback first
+    if (pc_->on_track_callback) {
+        pc_->on_track_callback(pc_->on_track_user_data, track_id.c_str(), is_video ? 1 : 0);
+    }
+
+    // Register sinks for frame callbacks
+    if (is_video) {
+        auto video_track = static_cast<webrtc::VideoTrackInterface*>(track.get());
+
+        // If video frame callback is set, register a sink
+        if (pc_->video_frame_callback) {
+            auto sink = std::make_unique<VideoSinkImpl>(
+                pc_->video_frame_callback,
+                pc_->video_frame_user_data
+            );
+            video_track->AddOrUpdateSink(sink.get(), webrtc::VideoSinkWants());
+            pc_->video_sinks.push_back(std::move(sink));
+            pc_->video_tracks.push_back(
+                webrtc::scoped_refptr<webrtc::VideoTrackInterface>(video_track)
+            );
+        }
+    } else {
+        auto audio_track = static_cast<webrtc::AudioTrackInterface*>(track.get());
+
+        // If audio frame callback is set, register a sink
+        if (pc_->audio_frame_callback) {
+            auto sink = std::make_unique<AudioSinkImpl>(
+                pc_->audio_frame_callback,
+                pc_->audio_frame_user_data
+            );
+            audio_track->AddSink(sink.get());
+            pc_->audio_sinks.push_back(std::move(sink));
+            pc_->audio_tracks.push_back(
+                webrtc::scoped_refptr<webrtc::AudioTrackInterface>(audio_track)
+            );
         }
     }
 }
@@ -392,6 +567,26 @@ WebrtcPeerConnection* webrtc_pc_create(
 
 void webrtc_pc_destroy(WebrtcPeerConnection* pc) {
     if (pc) {
+        // Remove video sinks from tracks
+        for (size_t i = 0; i < pc->video_tracks.size() && i < pc->video_sinks.size(); ++i) {
+            if (pc->video_tracks[i]) {
+                pc->video_tracks[i]->RemoveSink(pc->video_sinks[i].get());
+            }
+        }
+
+        // Remove audio sinks from tracks
+        for (size_t i = 0; i < pc->audio_tracks.size() && i < pc->audio_sinks.size(); ++i) {
+            if (pc->audio_tracks[i]) {
+                pc->audio_tracks[i]->RemoveSink(pc->audio_sinks[i].get());
+            }
+        }
+
+        // Clear vectors
+        pc->video_sinks.clear();
+        pc->audio_sinks.clear();
+        pc->video_tracks.clear();
+        pc->audio_tracks.clear();
+
         if (pc->pc) {
             pc->pc->Close();
             pc->pc = nullptr;
@@ -566,18 +761,60 @@ void webrtc_pc_set_on_ice_connection_state_change_callback(
     }
 }
 
+void webrtc_pc_set_on_ice_candidate_callback(
+    WebrtcPeerConnection* pc,
+    OnIceCandidateCallback callback,
+    void* user_data) {
+    if (pc) {
+        pc->on_ice_candidate_callback = callback;
+        pc->on_ice_candidate_user_data = user_data;
+    }
+}
+
+void webrtc_pc_set_on_ice_gathering_state_change_callback(
+    WebrtcPeerConnection* pc,
+    OnIceGatheringStateChangeCallback callback,
+    void* user_data) {
+    if (pc) {
+        pc->on_ice_gathering_state_callback = callback;
+        pc->on_ice_gathering_state_user_data = user_data;
+    }
+}
+
 void webrtc_video_track_set_frame_callback(
     WebrtcVideoTrack* track,
     VideoFrameCallback callback,
     void* user_data) {
-    // TODO: Implement video frame sink
+    // Deprecated: Use webrtc_pc_set_video_frame_callback instead
+    // This function is kept for API compatibility but does nothing
 }
 
 void webrtc_audio_track_set_frame_callback(
     WebrtcAudioTrack* track,
     AudioFrameCallback callback,
     void* user_data) {
-    // TODO: Implement audio frame sink
+    // Deprecated: Use webrtc_pc_set_audio_frame_callback instead
+    // This function is kept for API compatibility but does nothing
+}
+
+void webrtc_pc_set_video_frame_callback(
+    WebrtcPeerConnection* pc,
+    VideoFrameCallback callback,
+    void* user_data) {
+    if (pc) {
+        pc->video_frame_callback = callback;
+        pc->video_frame_user_data = user_data;
+    }
+}
+
+void webrtc_pc_set_audio_frame_callback(
+    WebrtcPeerConnection* pc,
+    AudioFrameCallback callback,
+    void* user_data) {
+    if (pc) {
+        pc->audio_frame_callback = callback;
+        pc->audio_frame_user_data = user_data;
+    }
 }
 
 void webrtc_free_string(char* str) {

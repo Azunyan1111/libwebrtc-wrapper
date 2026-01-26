@@ -9,7 +9,9 @@ use anyhow::Result;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-#[tokio::main]
+// Use current_thread runtime to prevent WebRTC raw pointers from being moved across threads.
+// libwebrtc objects are not thread-safe and must be accessed from the thread they were created on.
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     // Initialize logging
     let subscriber = FmtSubscriber::builder()
@@ -35,7 +37,7 @@ async fn main() -> Result<()> {
 
     // Run with Ctrl+C handling
     tokio::select! {
-        result = client.run() => {
+        result = async { client.run().await } => {
             if let Err(e) = result {
                 tracing::error!("Error: {}", e);
             }
