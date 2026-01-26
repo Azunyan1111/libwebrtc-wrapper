@@ -6,6 +6,7 @@
 
 #include "wrapper.h"
 
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -24,6 +25,7 @@
 #include "api/scoped_refptr.h"
 #include "api/ref_count.h"
 #include "api/make_ref_counted.h"
+#include "api/audio/audio_device.h"
 #include "rtc_base/thread.h"
 
 namespace {
@@ -36,6 +38,129 @@ char* strdup_wrapper(const std::string& s) {
     }
     return result;
 }
+
+// Dummy AudioDeviceModule that doesn't play or record any audio
+// This prevents audio from being played through speakers
+class DummyAudioDeviceModule : public webrtc::AudioDeviceModule {
+public:
+    static webrtc::scoped_refptr<DummyAudioDeviceModule> Create() {
+        return webrtc::scoped_refptr<DummyAudioDeviceModule>(
+            new DummyAudioDeviceModule());
+    }
+
+    // RefCountInterface implementation
+    void AddRef() const override {
+        ref_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    webrtc::RefCountReleaseStatus Release() const override {
+        int count = ref_count_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (count == 0) {
+            delete this;
+            return webrtc::RefCountReleaseStatus::kDroppedLastRef;
+        }
+        return webrtc::RefCountReleaseStatus::kOtherRefsRemained;
+    }
+
+    // AudioDeviceModule implementation
+    int32_t ActiveAudioLayer(AudioLayer* audio_layer) const override {
+        *audio_layer = AudioLayer::kDummyAudio;
+        return 0;
+    }
+    int32_t RegisterAudioCallback(webrtc::AudioTransport* callback) override {
+        return 0;
+    }
+    int32_t Init() override { return 0; }
+    int32_t Terminate() override { return 0; }
+    bool Initialized() const override { return true; }
+    int16_t PlayoutDevices() override { return 0; }
+    int16_t RecordingDevices() override { return 0; }
+    int32_t PlayoutDeviceName(uint16_t, char*, char*) override { return 0; }
+    int32_t RecordingDeviceName(uint16_t, char*, char*) override { return 0; }
+    int32_t SetPlayoutDevice(uint16_t) override { return 0; }
+    int32_t SetPlayoutDevice(WindowsDeviceType) override { return 0; }
+    int32_t SetRecordingDevice(uint16_t) override { return 0; }
+    int32_t SetRecordingDevice(WindowsDeviceType) override { return 0; }
+    int32_t PlayoutIsAvailable(bool* available) override {
+        *available = false;
+        return 0;
+    }
+    int32_t InitPlayout() override { return 0; }
+    bool PlayoutIsInitialized() const override { return false; }
+    int32_t RecordingIsAvailable(bool* available) override {
+        *available = false;
+        return 0;
+    }
+    int32_t InitRecording() override { return 0; }
+    bool RecordingIsInitialized() const override { return false; }
+    int32_t StartPlayout() override { return 0; }
+    int32_t StopPlayout() override { return 0; }
+    bool Playing() const override { return false; }
+    int32_t StartRecording() override { return 0; }
+    int32_t StopRecording() override { return 0; }
+    bool Recording() const override { return false; }
+    int32_t InitSpeaker() override { return 0; }
+    bool SpeakerIsInitialized() const override { return false; }
+    int32_t InitMicrophone() override { return 0; }
+    bool MicrophoneIsInitialized() const override { return false; }
+    int32_t SpeakerVolumeIsAvailable(bool* available) override {
+        *available = false;
+        return 0;
+    }
+    int32_t SetSpeakerVolume(uint32_t) override { return -1; }
+    int32_t SpeakerVolume(uint32_t* volume) const override { return -1; }
+    int32_t MaxSpeakerVolume(uint32_t* max) const override { return -1; }
+    int32_t MinSpeakerVolume(uint32_t* min) const override { return -1; }
+    int32_t MicrophoneVolumeIsAvailable(bool* available) override {
+        *available = false;
+        return 0;
+    }
+    int32_t SetMicrophoneVolume(uint32_t) override { return -1; }
+    int32_t MicrophoneVolume(uint32_t* volume) const override { return -1; }
+    int32_t MaxMicrophoneVolume(uint32_t* max) const override { return -1; }
+    int32_t MinMicrophoneVolume(uint32_t* min) const override { return -1; }
+    int32_t SpeakerMuteIsAvailable(bool* available) override {
+        *available = false;
+        return 0;
+    }
+    int32_t SetSpeakerMute(bool) override { return -1; }
+    int32_t SpeakerMute(bool* enabled) const override { return -1; }
+    int32_t MicrophoneMuteIsAvailable(bool* available) override {
+        *available = false;
+        return 0;
+    }
+    int32_t SetMicrophoneMute(bool) override { return -1; }
+    int32_t MicrophoneMute(bool* enabled) const override { return -1; }
+    int32_t StereoPlayoutIsAvailable(bool* available) const override {
+        *available = false;
+        return 0;
+    }
+    int32_t SetStereoPlayout(bool) override { return -1; }
+    int32_t StereoPlayout(bool* enabled) const override { return -1; }
+    int32_t StereoRecordingIsAvailable(bool* available) const override {
+        *available = false;
+        return 0;
+    }
+    int32_t SetStereoRecording(bool) override { return -1; }
+    int32_t StereoRecording(bool* enabled) const override { return -1; }
+    int32_t PlayoutDelay(uint16_t* delay_ms) const override {
+        *delay_ms = 0;
+        return 0;
+    }
+    bool BuiltInAECIsAvailable() const override { return false; }
+    int32_t EnableBuiltInAEC(bool) override { return -1; }
+    bool BuiltInAGCIsAvailable() const override { return false; }
+    int32_t EnableBuiltInAGC(bool) override { return -1; }
+    bool BuiltInNSIsAvailable() const override { return false; }
+    int32_t EnableBuiltInNS(bool) override { return -1; }
+
+protected:
+    DummyAudioDeviceModule() : ref_count_(0) {}
+    ~DummyAudioDeviceModule() override = default;
+
+private:
+    mutable std::atomic<int> ref_count_;
+};
 
 // Global threads for libwebrtc
 std::unique_ptr<webrtc::Thread> g_signaling_thread;
@@ -204,11 +329,14 @@ extern "C" {
 WebrtcPeerConnectionFactory* webrtc_factory_create(void) {
     EnsureThreads();
 
+    // Use DummyAudioDeviceModule to prevent audio from being played through speakers
+    auto dummy_adm = DummyAudioDeviceModule::Create();
+
     auto factory = webrtc::CreatePeerConnectionFactory(
         g_network_thread.get(),
         g_worker_thread.get(),
         g_signaling_thread.get(),
-        nullptr,  // default_adm
+        dummy_adm,  // Use dummy ADM to disable speaker output
         webrtc::CreateBuiltinAudioEncoderFactory(),
         webrtc::CreateBuiltinAudioDecoderFactory(),
         webrtc::CreateBuiltinVideoEncoderFactory(),
