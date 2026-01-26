@@ -1,0 +1,3 @@
+[submodule "libwebrtc"]
+	path = libwebrtc
+	url = https://webrtc.googlesource.com/src
