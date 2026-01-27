@@ -5,48 +5,38 @@ fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let manifest_path = PathBuf::from(&manifest_dir);
 
-    // WebRTC directory (relative to workspace root)
+    // WebRTC directory (headers + library)
     let webrtc_dir = manifest_path
         .join("../../deps/webrtc/macos_arm64")
         .canonicalize()
-        .expect("WebRTC directory not found. Run 'make download' first.");
+        .expect("WebRTC directory not found.");
 
     let include_dir = webrtc_dir.join("include");
     let lib_dir = webrtc_dir.join("lib");
 
-    // Our custom include directory with __config_site override
-    let custom_include = manifest_path.join("wrapper/include");
-
     println!("cargo:rerun-if-changed=wrapper/wrapper.h");
     println!("cargo:rerun-if-changed=wrapper/wrapper.cpp");
-    println!("cargo:rerun-if-changed=wrapper/include/__config_site");
 
     // Compile wrapper.cpp
     //
-    // libwebrtc.a uses libc++ with __Cr namespace (Chromium ABI).
-    // We override __config_site to use the same ABI namespace.
-    //
-    // The key is to include our custom __config_site BEFORE the system one.
-    // This is done by adding our include directory with -isystem FIRST.
+    // libwebrtc.a is built with use_custom_libcxx=false,
+    // which means it uses the system libc++ without custom ABI namespace.
     cc::Build::new()
         .cpp(true)
         .file("wrapper/wrapper.cpp")
-        // CRITICAL: Our custom include dir must come FIRST to override __config_site
-        .flag(&format!("-isystem{}", custom_include.display()))
-        // WebRTC headers
         .include(&include_dir)
         .include(include_dir.join("third_party/abseil-cpp"))
         .include(include_dir.join("third_party/libyuv/include"))
         .flag("-std=c++17")
         .flag("-stdlib=libc++")
-        .flag("-fno-rtti")
+        .flag("-frtti")
         .flag("-Wno-deprecated-declarations")
         .flag("-Wno-unused-parameter")
         .define("WEBRTC_MAC", None)
         .define("WEBRTC_POSIX", None)
         .compile("webrtc_wrapper");
 
-    // Link libwebrtc.a static library
+    // Link libwebrtc.a
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=static=webrtc");
 
