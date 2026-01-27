@@ -3,10 +3,14 @@
 use anyhow::{anyhow, Result};
 use libwebrtc_sys::*;
 use std::ffi::{CStr, CString};
+use std::fs::{self, File};
+use std::io::Write;
 use std::os::raw::c_void;
+use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Mutex;
 use tracing::{debug, info, trace, warn};
 use url::Url;
 
@@ -28,17 +32,26 @@ pub struct WhepClient {
     callback_context: Option<Box<CallbackContext>>,
     ice_candidate_rx: Option<Receiver<IceCandidate>>,
     end_of_candidates_sent: bool,
+    output_dir: PathBuf,
 }
 
 use std::sync::atomic::Ordering;
 
-/// Context for frame counting and statistics.
+/// Context for frame counting, statistics, and file output.
 /// Passed to C callbacks as user_data pointer.
 pub struct CallbackContext {
     pub video_frame_count: AtomicU64,
     pub audio_frame_count: AtomicU64,
     pub ice_gathering_complete: AtomicBool,
     pub ice_candidate_tx: Sender<IceCandidate>,
+    // File output for frame data
+    pub video_file: Mutex<Option<File>>,
+    pub audio_file: Mutex<Option<File>>,
+    // Metadata storage (set on first frame)
+    pub video_width: AtomicU64,
+    pub video_height: AtomicU64,
+    pub audio_sample_rate: AtomicU64,
+    pub audio_channels: AtomicU64,
 }
 
 // WhepClient intentionally does NOT implement Send.
@@ -46,9 +59,12 @@ pub struct CallbackContext {
 // Use #[tokio::main(flavor = "current_thread")] to ensure single-threaded execution.
 
 impl WhepClient {
-    /// Create a new WHEP client
-    pub fn new(whep_url: &str) -> Result<Self> {
+    /// Create a new WHEP client with output directory for frame data
+    pub fn new(whep_url: &str, output_dir: PathBuf) -> Result<Self> {
         let http_client = reqwest::Client::builder().build()?;
+
+        // Create output directory if it doesn't exist
+        fs::create_dir_all(&output_dir)?;
 
         Ok(Self {
             whep_url: whep_url.to_string(),
@@ -59,6 +75,7 @@ impl WhepClient {
             callback_context: None,
             ice_candidate_rx: None,
             end_of_candidates_sent: false,
+            output_dir,
         })
     }
 
@@ -83,13 +100,27 @@ impl WhepClient {
         }
         self.peer_connection = pc;
 
-        // Set up callback context with ICE candidate channel
+        // Set up callback context with ICE candidate channel and file output
         let (ice_tx, ice_rx) = mpsc::channel();
+
+        // Create output files
+        let video_file_path = self.output_dir.join("video.yuv");
+        let audio_file_path = self.output_dir.join("audio.pcm");
+        let video_file = File::create(&video_file_path)?;
+        let audio_file = File::create(&audio_file_path)?;
+        info!("Output files: {:?}, {:?}", video_file_path, audio_file_path);
+
         let ctx = Box::new(CallbackContext {
             video_frame_count: AtomicU64::new(0),
             audio_frame_count: AtomicU64::new(0),
             ice_gathering_complete: AtomicBool::new(false),
             ice_candidate_tx: ice_tx,
+            video_file: Mutex::new(Some(video_file)),
+            audio_file: Mutex::new(Some(audio_file)),
+            video_width: AtomicU64::new(0),
+            video_height: AtomicU64::new(0),
+            audio_sample_rate: AtomicU64::new(0),
+            audio_channels: AtomicU64::new(0),
         });
         self.callback_context = Some(ctx);
         self.ice_candidate_rx = Some(ice_rx);
@@ -182,24 +213,69 @@ impl WhepClient {
             info!("ICE connection state changed: {}", state_str);
         }
 
-        // Video frame callback - counts frames and logs periodically
+        // Video frame callback - writes I420 YUV data to file
         unsafe extern "C" fn on_video_frame(
             user_data: *mut c_void,
             width: i32,
             height: i32,
             timestamp_us: i64,
-            _y_data: *const u8,
-            _y_stride: i32,
-            _u_data: *const u8,
-            _u_stride: i32,
-            _v_data: *const u8,
-            _v_stride: i32,
+            y_data: *const u8,
+            y_stride: i32,
+            u_data: *const u8,
+            u_stride: i32,
+            v_data: *const u8,
+            v_stride: i32,
         ) {
             if user_data.is_null() {
                 return;
             }
             let ctx = &*(user_data as *const CallbackContext);
             let count = ctx.video_frame_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+            // Store metadata on first frame
+            if count == 1 {
+                ctx.video_width.store(width as u64, Ordering::Relaxed);
+                ctx.video_height.store(height as u64, Ordering::Relaxed);
+                info!(
+                    "Video format detected: {}x{} (y_stride={}, u_stride={}, v_stride={})",
+                    width, height, y_stride, u_stride, v_stride
+                );
+            }
+
+            // Write I420 YUV data to file
+            // I420 format: Y plane (width*height) + U plane (width/2 * height/2) + V plane (width/2 * height/2)
+            if let Ok(mut guard) = ctx.video_file.lock() {
+                if let Some(ref mut file) = *guard {
+                    let w = width as usize;
+                    let h = height as usize;
+                    let y_stride_usize = y_stride as usize;
+                    let u_stride_usize = u_stride as usize;
+                    let v_stride_usize = v_stride as usize;
+
+                    // Write Y plane (row by row to handle stride)
+                    for row in 0..h {
+                        let row_start = row * y_stride_usize;
+                        let row_data = std::slice::from_raw_parts(y_data.add(row_start), w);
+                        let _ = file.write_all(row_data);
+                    }
+
+                    // Write U plane (half width, half height)
+                    let uv_h = h / 2;
+                    let uv_w = w / 2;
+                    for row in 0..uv_h {
+                        let row_start = row * u_stride_usize;
+                        let row_data = std::slice::from_raw_parts(u_data.add(row_start), uv_w);
+                        let _ = file.write_all(row_data);
+                    }
+
+                    // Write V plane (half width, half height)
+                    for row in 0..uv_h {
+                        let row_start = row * v_stride_usize;
+                        let row_data = std::slice::from_raw_parts(v_data.add(row_start), uv_w);
+                        let _ = file.write_all(row_data);
+                    }
+                }
+            }
 
             // Log every 30 frames (approximately once per second at 30fps)
             if count % 30 == 1 {
@@ -210,19 +286,44 @@ impl WhepClient {
             }
         }
 
-        // Audio frame callback - counts frames
+        // Audio frame callback - writes PCM S16LE interleaved data to file
         unsafe extern "C" fn on_audio_frame(
             user_data: *mut c_void,
             sample_rate: i32,
             num_channels: usize,
             samples_per_channel: usize,
-            _data: *const i16,
+            data: *const i16,
         ) {
             if user_data.is_null() {
                 return;
             }
             let ctx = &*(user_data as *const CallbackContext);
             let count = ctx.audio_frame_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+            // Store metadata on first frame
+            if count == 1 {
+                ctx.audio_sample_rate.store(sample_rate as u64, Ordering::Relaxed);
+                ctx.audio_channels.store(num_channels as u64, Ordering::Relaxed);
+                info!(
+                    "Audio format detected: {}Hz {}ch ({} samples/channel)",
+                    sample_rate, num_channels, samples_per_channel
+                );
+            }
+
+            // Write PCM S16LE interleaved data to file
+            // Data layout: [L0, R0, L1, R1, ...] for stereo (interleaved)
+            if let Ok(mut guard) = ctx.audio_file.lock() {
+                if let Some(ref mut file) = *guard {
+                    let total_samples = samples_per_channel * num_channels;
+                    let audio_data = std::slice::from_raw_parts(data, total_samples);
+                    // Convert i16 slice to bytes (S16LE)
+                    let byte_data = std::slice::from_raw_parts(
+                        audio_data.as_ptr() as *const u8,
+                        total_samples * 2,
+                    );
+                    let _ = file.write_all(byte_data);
+                }
+            }
 
             // Log every 100 frames (approximately once per second at 48kHz/480 samples)
             if count % 100 == 1 {
@@ -541,8 +642,44 @@ impl WhepClient {
         Ok(WhepResponse { sdp, resource_url })
     }
 
-    /// Close the connection
+    /// Close the connection and write metadata file
     pub async fn close(&mut self) -> Result<()> {
+        // Write metadata file with frame format info
+        if let Some(ref ctx) = self.callback_context {
+            let video_width = ctx.video_width.load(Ordering::Relaxed);
+            let video_height = ctx.video_height.load(Ordering::Relaxed);
+            let audio_sample_rate = ctx.audio_sample_rate.load(Ordering::Relaxed);
+            let audio_channels = ctx.audio_channels.load(Ordering::Relaxed);
+            let video_frames = ctx.video_frame_count.load(Ordering::Relaxed);
+            let audio_frames = ctx.audio_frame_count.load(Ordering::Relaxed);
+
+            let metadata_path = self.output_dir.join("metadata.txt");
+            let metadata_content = format!(
+                "# WHEP Client Capture Metadata\n\
+                 # Video playback: ffplay -f rawvideo -pix_fmt yuv420p -s {}x{} video.yuv\n\
+                 # Audio playback: ffplay -f s16le -ar {} -ac {} audio.pcm\n\n\
+                 video_width={}\n\
+                 video_height={}\n\
+                 video_frames={}\n\
+                 audio_sample_rate={}\n\
+                 audio_channels={}\n\
+                 audio_frames={}\n",
+                video_width, video_height, audio_sample_rate, audio_channels,
+                video_width, video_height, video_frames,
+                audio_sample_rate, audio_channels, audio_frames
+            );
+
+            if let Ok(mut file) = File::create(&metadata_path) {
+                let _ = file.write_all(metadata_content.as_bytes());
+                info!("Metadata written to {:?}", metadata_path);
+            }
+
+            info!(
+                "Capture complete: {} video frames, {} audio frames",
+                video_frames, audio_frames
+            );
+        }
+
         if !self.peer_connection.is_null() {
             unsafe {
                 webrtc_pc_destroy(self.peer_connection);

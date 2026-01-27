@@ -7,10 +7,12 @@
 #include "wrapper.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <condition_variable>
 
@@ -41,14 +43,30 @@ char* strdup_wrapper(const std::string& s) {
     return result;
 }
 
-// Dummy AudioDeviceModule that doesn't play or record any audio through speakers
-// This prevents audio from being played through speakers while still allowing
-// audio frames to be received via AudioTransport callback for future use.
+// Audio callback type for delivering playout audio data
+typedef void (*PlayoutAudioCallback)(
+    void* user_data,
+    int sample_rate,
+    size_t num_channels,
+    size_t samples_per_channel,
+    const int16_t* data
+);
+
+// Dummy AudioDeviceModule that simulates audio playout without actual speakers.
+// This enables the audio pipeline to deliver decoded audio to AudioTrackSinkInterface.
+// A background thread periodically calls NeedMorePlayData to pull audio from the pipeline.
 class DummyAudioDeviceModule : public webrtc::AudioDeviceModule {
 public:
     static webrtc::scoped_refptr<DummyAudioDeviceModule> Create() {
         return webrtc::scoped_refptr<DummyAudioDeviceModule>(
             new DummyAudioDeviceModule());
+    }
+
+    // Set callback to receive playout audio data
+    void SetPlayoutCallback(PlayoutAudioCallback callback, void* user_data) {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        playout_callback_ = callback;
+        playout_callback_user_data_ = user_data;
     }
 
     // RefCountInterface implementation
@@ -71,50 +89,101 @@ public:
         return 0;
     }
 
-    // Store the audio transport callback for potential future use
-    // (e.g., extracting decoded audio frames for MKV output)
     int32_t RegisterAudioCallback(webrtc::AudioTransport* callback) override {
         std::lock_guard<std::mutex> lock(audio_transport_mutex_);
         audio_transport_ = callback;
         return 0;
     }
 
-    // Accessor for future audio frame extraction
     webrtc::AudioTransport* GetAudioTransport() const {
         std::lock_guard<std::mutex> lock(audio_transport_mutex_);
         return audio_transport_;
     }
-    int32_t Init() override { return 0; }
-    int32_t Terminate() override { return 0; }
-    bool Initialized() const override { return true; }
-    int16_t PlayoutDevices() override { return 0; }
+
+    int32_t Init() override {
+        initialized_ = true;
+        return 0;
+    }
+
+    int32_t Terminate() override {
+        StopPlayout();
+        initialized_ = false;
+        return 0;
+    }
+
+    bool Initialized() const override { return initialized_; }
+    int16_t PlayoutDevices() override { return 1; }
     int16_t RecordingDevices() override { return 0; }
-    int32_t PlayoutDeviceName(uint16_t, char*, char*) override { return 0; }
+    int32_t PlayoutDeviceName(uint16_t, char* name, char* guid) override {
+        if (name) strcpy(name, "DummyPlayout");
+        if (guid) strcpy(guid, "dummy-playout-guid");
+        return 0;
+    }
     int32_t RecordingDeviceName(uint16_t, char*, char*) override { return 0; }
     int32_t SetPlayoutDevice(uint16_t) override { return 0; }
     int32_t SetPlayoutDevice(WindowsDeviceType) override { return 0; }
     int32_t SetRecordingDevice(uint16_t) override { return 0; }
     int32_t SetRecordingDevice(WindowsDeviceType) override { return 0; }
+
     int32_t PlayoutIsAvailable(bool* available) override {
-        *available = false;
+        *available = true;
         return 0;
     }
-    int32_t InitPlayout() override { return 0; }
-    bool PlayoutIsInitialized() const override { return false; }
+
+    int32_t InitPlayout() override {
+        playout_initialized_ = true;
+        return 0;
+    }
+
+    bool PlayoutIsInitialized() const override {
+        return playout_initialized_;
+    }
+
     int32_t RecordingIsAvailable(bool* available) override {
         *available = false;
         return 0;
     }
     int32_t InitRecording() override { return 0; }
     bool RecordingIsInitialized() const override { return false; }
-    int32_t StartPlayout() override { return 0; }
-    int32_t StopPlayout() override { return 0; }
-    bool Playing() const override { return false; }
+
+    int32_t StartPlayout() override {
+        if (!playout_initialized_) {
+            return -1;
+        }
+        if (playing_) {
+            return 0;
+        }
+        playing_ = true;
+        stop_playout_thread_ = false;
+
+        // Start background thread to pull audio data
+        playout_thread_ = std::thread([this]() {
+            PlayoutThreadFunc();
+        });
+
+        return 0;
+    }
+
+    int32_t StopPlayout() override {
+        if (!playing_) {
+            return 0;
+        }
+        playing_ = false;
+        stop_playout_thread_ = true;
+
+        if (playout_thread_.joinable()) {
+            playout_thread_.join();
+        }
+        return 0;
+    }
+
+    bool Playing() const override { return playing_; }
+
     int32_t StartRecording() override { return 0; }
     int32_t StopRecording() override { return 0; }
     bool Recording() const override { return false; }
     int32_t InitSpeaker() override { return 0; }
-    bool SpeakerIsInitialized() const override { return false; }
+    bool SpeakerIsInitialized() const override { return true; }
     int32_t InitMicrophone() override { return 0; }
     bool MicrophoneIsInitialized() const override { return false; }
     int32_t SpeakerVolumeIsAvailable(bool* available) override {
@@ -145,22 +214,31 @@ public:
     }
     int32_t SetMicrophoneMute(bool) override { return -1; }
     int32_t MicrophoneMute(bool* enabled) const override { return -1; }
+
     int32_t StereoPlayoutIsAvailable(bool* available) const override {
-        *available = false;
+        *available = true;
         return 0;
     }
-    int32_t SetStereoPlayout(bool) override { return -1; }
-    int32_t StereoPlayout(bool* enabled) const override { return -1; }
+    int32_t SetStereoPlayout(bool enable) override {
+        stereo_playout_ = enable;
+        return 0;
+    }
+    int32_t StereoPlayout(bool* enabled) const override {
+        *enabled = stereo_playout_;
+        return 0;
+    }
     int32_t StereoRecordingIsAvailable(bool* available) const override {
         *available = false;
         return 0;
     }
     int32_t SetStereoRecording(bool) override { return -1; }
     int32_t StereoRecording(bool* enabled) const override { return -1; }
+
     int32_t PlayoutDelay(uint16_t* delay_ms) const override {
-        *delay_ms = 0;
+        *delay_ms = 10;  // 10ms playout delay
         return 0;
     }
+
     bool BuiltInAECIsAvailable() const override { return false; }
     int32_t EnableBuiltInAEC(bool) override { return -1; }
     bool BuiltInAGCIsAvailable() const override { return false; }
@@ -169,13 +247,87 @@ public:
     int32_t EnableBuiltInNS(bool) override { return -1; }
 
 protected:
-    DummyAudioDeviceModule() : ref_count_(0), audio_transport_(nullptr) {}
-    ~DummyAudioDeviceModule() override = default;
+    DummyAudioDeviceModule()
+        : ref_count_(0),
+          audio_transport_(nullptr),
+          initialized_(false),
+          playout_initialized_(false),
+          playing_(false),
+          stereo_playout_(true),
+          stop_playout_thread_(false),
+          playout_callback_(nullptr),
+          playout_callback_user_data_(nullptr) {}
+
+    ~DummyAudioDeviceModule() override {
+        StopPlayout();
+    }
 
 private:
+    void PlayoutThreadFunc() {
+        // Audio parameters: 48kHz, stereo, 10ms frames
+        const int kSampleRate = 48000;
+        const size_t kNumChannels = stereo_playout_ ? 2 : 1;
+        const size_t kSamplesPerChannel = kSampleRate / 100;  // 10ms
+        const size_t kTotalSamples = kSamplesPerChannel * kNumChannels;
+
+        std::vector<int16_t> audio_buffer(kTotalSamples, 0);
+        int64_t elapsed_time_ms = 0;
+        int64_t ntp_time_ms = 0;
+
+        while (!stop_playout_thread_) {
+            // Sleep for approximately 10ms
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+            webrtc::AudioTransport* transport = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(audio_transport_mutex_);
+                transport = audio_transport_;
+            }
+
+            if (transport && playing_) {
+                // Pull audio data from the audio pipeline
+                size_t samples_out = 0;
+                transport->NeedMorePlayData(
+                    kSamplesPerChannel,
+                    sizeof(int16_t) * 8,  // bits per sample
+                    kNumChannels,
+                    kSampleRate,
+                    audio_buffer.data(),
+                    samples_out,
+                    &elapsed_time_ms,
+                    &ntp_time_ms
+                );
+
+                // Deliver audio to registered callback
+                PlayoutAudioCallback cb = nullptr;
+                void* cb_user_data = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(callback_mutex_);
+                    cb = playout_callback_;
+                    cb_user_data = playout_callback_user_data_;
+                }
+
+                if (cb && samples_out > 0) {
+                    cb(cb_user_data, kSampleRate, kNumChannels, kSamplesPerChannel, audio_buffer.data());
+                }
+            }
+        }
+    }
+
     mutable std::atomic<int> ref_count_;
     mutable std::mutex audio_transport_mutex_;
     webrtc::AudioTransport* audio_transport_;
+    bool initialized_;
+    bool playout_initialized_;
+    std::atomic<bool> playing_;
+    bool stereo_playout_;
+    std::atomic<bool> stop_playout_thread_;
+    std::thread playout_thread_;
+
+    // Callback for playout audio
+    mutable std::mutex callback_mutex_;
+    PlayoutAudioCallback playout_callback_;
+    void* playout_callback_user_data_;
 };
 
 // Global threads for libwebrtc
@@ -280,6 +432,7 @@ private:
 // Opaque struct definitions
 struct WebrtcPeerConnectionFactory {
     webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
+    webrtc::scoped_refptr<DummyAudioDeviceModule> adm;
 };
 
 struct WebrtcPeerConnection;
@@ -304,6 +457,7 @@ private:
 struct WebrtcPeerConnection {
     webrtc::scoped_refptr<webrtc::PeerConnectionInterface> pc;
     std::unique_ptr<PeerConnectionObserverImpl> observer;
+    WebrtcPeerConnectionFactory* factory = nullptr;  // Reference to factory for ADM access
 
     OnTrackCallback on_track_callback = nullptr;
     void* on_track_user_data = nullptr;
@@ -405,20 +559,10 @@ void PeerConnectionObserverImpl::OnTrack(
             );
         }
     } else {
-        auto audio_track = static_cast<webrtc::AudioTrackInterface*>(track.get());
-
-        // If audio frame callback is set, register a sink
-        if (pc_->audio_frame_callback) {
-            auto sink = std::make_unique<AudioSinkImpl>(
-                pc_->audio_frame_callback,
-                pc_->audio_frame_user_data
-            );
-            audio_track->AddSink(sink.get());
-            pc_->audio_sinks.push_back(std::move(sink));
-            pc_->audio_tracks.push_back(
-                webrtc::scoped_refptr<webrtc::AudioTrackInterface>(audio_track)
-            );
-        }
+        // Audio is handled via DummyAudioDeviceModule's playout callback
+        // AudioTrackSinkInterface::OnData delivers empty data, so we don't use it
+        // The ADM's NeedMorePlayData pulls the actual decoded audio
+        (void)track;  // Suppress unused variable warning
     }
 }
 
@@ -526,6 +670,7 @@ WebrtcPeerConnectionFactory* webrtc_factory_create(void) {
 
     auto* wrapper = new WebrtcPeerConnectionFactory();
     wrapper->factory = factory;
+    wrapper->adm = dummy_adm;  // Save ADM reference for audio callback
     return wrapper;
 }
 
@@ -552,6 +697,7 @@ WebrtcPeerConnection* webrtc_pc_create(
 
     auto* wrapper = new WebrtcPeerConnection();
     wrapper->observer = std::make_unique<PeerConnectionObserverImpl>(wrapper);
+    wrapper->factory = factory;  // Save factory reference for ADM access
 
     webrtc::PeerConnectionDependencies deps(wrapper->observer.get());
 
@@ -814,6 +960,15 @@ void webrtc_pc_set_audio_frame_callback(
     if (pc) {
         pc->audio_frame_callback = callback;
         pc->audio_frame_user_data = user_data;
+
+        // Also register callback with ADM for playout audio
+        if (pc->factory && pc->factory->adm) {
+            // Cast AudioFrameCallback to PlayoutAudioCallback (same signature)
+            pc->factory->adm->SetPlayoutCallback(
+                reinterpret_cast<PlayoutAudioCallback>(callback),
+                user_data
+            );
+        }
     }
 }
 

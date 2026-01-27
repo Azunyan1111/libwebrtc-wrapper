@@ -8,6 +8,9 @@
 /libwebrtc/
 webrtc.*.tar.gz
 
+# Test output (generated media files)
+/test_output/
+
 # IDE / Editor
 .idea/
 .vscode/
@@ -15,6 +18,9 @@ webrtc.*.tar.gz
 *.swo
 *~
 .DS_Store
+
+# Claude Code
+.claude/
 
 # Debug files
 *.dSYM/
