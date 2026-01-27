@@ -1,59 +1,54 @@
 //! WHEP Client - WebRTC-HTTP Egress Protocol client
 //!
 //! Connects to a WHEP endpoint and receives WebRTC streams,
-//! outputting decoded video (rawvideo I420) and audio (PCM S16LE) to files.
+//! outputting MKV (Matroska) format to stdout.
 //!
 //! Usage:
-//!   whep-client [WHEP_URL] [-o OUTPUT_DIR]
+//!   whep-client [WHEP_URL] > output.mkv
+//!   whep-client [WHEP_URL] | ffplay -f matroska -i -
 //!
-//! Output files:
-//!   output/video.yuv   - I420 rawvideo (ffplay -f rawvideo -pix_fmt yuv420p -s WxH video.yuv)
-//!   output/audio.pcm   - PCM S16LE (ffplay -f s16le -ar RATE -ac CH audio.pcm)
-//!   output/metadata.txt - Playback parameters
+//! Video codec: V_UNCOMPRESSED (I420 YUV)
+//! Audio codec: A_PCM/INT/LIT (PCM S16LE)
 
+mod mkv_writer;
 mod whep;
 
 use anyhow::Result;
-use std::path::PathBuf;
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
 
 /// Parse command line arguments
-/// Returns (whep_url, output_dir)
-fn parse_args() -> (String, PathBuf) {
+/// Returns whep_url
+fn parse_args() -> String {
     let args: Vec<String> = std::env::args().collect();
 
     let default_url = "https://customer-2y2pi15b1mgfooko.cloudflarestream.com/e94a1943c1b42fef532875db0673477c/webRTC/play".to_string();
-    let default_output = PathBuf::from("./output");
 
     let mut whep_url = default_url;
-    let mut output_dir = default_output;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "-o" | "--output" => {
-                if i + 1 < args.len() {
-                    output_dir = PathBuf::from(&args[i + 1]);
-                    i += 2;
-                } else {
-                    eprintln!("Error: -o requires an argument");
-                    std::process::exit(1);
-                }
-            }
             "-h" | "--help" => {
                 eprintln!("WHEP Client - WebRTC-HTTP Egress Protocol client");
                 eprintln!();
-                eprintln!("Usage: whep-client [WHEP_URL] [-o OUTPUT_DIR]");
+                eprintln!("Usage: whep-client [WHEP_URL] > output.mkv");
+                eprintln!("       whep-client [WHEP_URL] | ffplay -f matroska -i -");
                 eprintln!();
                 eprintln!("Options:");
-                eprintln!("  -o, --output <DIR>  Output directory for YUV/PCM files [default: ./output]");
                 eprintln!("  -h, --help          Show this help message");
                 eprintln!();
-                eprintln!("Output files:");
-                eprintln!("  video.yuv    - I420 rawvideo");
-                eprintln!("  audio.pcm    - PCM S16LE interleaved");
-                eprintln!("  metadata.txt - Playback parameters (width, height, sample rate, etc.)");
+                eprintln!("Output: MKV (Matroska) format to stdout");
+                eprintln!("  Video: V_UNCOMPRESSED (I420 YUV)");
+                eprintln!("  Audio: A_PCM/INT/LIT (PCM S16LE, 48kHz, stereo)");
+                eprintln!();
+                eprintln!("Examples:");
+                eprintln!("  # Save to file");
+                eprintln!("  whep-client https://example.com/whep > output.mkv");
+                eprintln!();
+                eprintln!("  # Play directly with ffplay");
+                eprintln!("  whep-client https://example.com/whep | ffplay -f matroska -i -");
+                eprintln!();
+                eprintln!("  # Verify with ffprobe");
+                eprintln!("  whep-client https://example.com/whep > output.mkv && ffprobe output.mkv");
                 std::process::exit(0);
             }
             arg if !arg.starts_with('-') => {
@@ -67,40 +62,35 @@ fn parse_args() -> (String, PathBuf) {
         }
     }
 
-    (whep_url, output_dir)
+    whep_url
 }
 
 // Use current_thread runtime to prevent WebRTC raw pointers from being moved across threads.
 // libwebrtc objects are not thread-safe and must be accessed from the thread they were created on.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    // Initialize logging
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::DEBUG)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    // All logs go to stderr (stdout is reserved for MKV output)
+    eprintln!("[INFO] WHEP Client starting...");
 
-    info!("WHEP Client starting...");
+    let whep_url = parse_args();
 
-    let (whep_url, output_dir) = parse_args();
+    eprintln!("[INFO] Connecting to WHEP endpoint: {}", whep_url);
+    eprintln!("[INFO] MKV output will be streamed to stdout");
 
-    info!("Connecting to WHEP endpoint: {}", whep_url);
-    info!("Output directory: {:?}", output_dir);
-
-    let mut client = whep::WhepClient::new(&whep_url, output_dir)?;
+    let mut client = whep::WhepClient::new(&whep_url)?;
     client.connect().await?;
 
-    info!("Connected. Receiving frames (Press Ctrl+C to stop)...");
+    eprintln!("[INFO] Connected. Receiving frames (Press Ctrl+C to stop)...");
 
     // Run with Ctrl+C handling
     tokio::select! {
         result = async { client.run().await } => {
             if let Err(e) = result {
-                tracing::error!("Error: {}", e);
+                eprintln!("[ERROR] {}", e);
             }
         }
         _ = tokio::signal::ctrl_c() => {
-            info!("Received Ctrl+C, shutting down...");
+            eprintln!("[INFO] Received Ctrl+C, shutting down...");
         }
     }
 

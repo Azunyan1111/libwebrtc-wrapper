@@ -1,17 +1,16 @@
 //! WHEP (WebRTC-HTTP Egress Protocol) client implementation
 
+use crate::mkv_writer::{MkvConfig, MkvWriter};
 use anyhow::{anyhow, Result};
 use libwebrtc_sys::*;
 use std::ffi::{CStr, CString};
-use std::fs::{self, File};
-use std::io::Write;
+use std::io::{BufWriter, Stdout};
 use std::os::raw::c_void;
-use std::path::PathBuf;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 
 /// ICE candidate information for trickle ICE
@@ -32,26 +31,28 @@ pub struct WhepClient {
     callback_context: Option<Box<CallbackContext>>,
     ice_candidate_rx: Option<Receiver<IceCandidate>>,
     end_of_candidates_sent: bool,
-    output_dir: PathBuf,
 }
 
 use std::sync::atomic::Ordering;
 
-/// Context for frame counting, statistics, and file output.
+/// Context for frame counting, statistics, and MKV output.
 /// Passed to C callbacks as user_data pointer.
 pub struct CallbackContext {
     pub video_frame_count: AtomicU64,
     pub audio_frame_count: AtomicU64,
     pub ice_gathering_complete: AtomicBool,
     pub ice_candidate_tx: Sender<IceCandidate>,
-    // File output for frame data
-    pub video_file: Mutex<Option<File>>,
-    pub audio_file: Mutex<Option<File>>,
+    // MKV writer for stdout output
+    pub mkv_writer: Mutex<Option<MkvWriter<BufWriter<Stdout>>>>,
     // Metadata storage (set on first frame)
     pub video_width: AtomicU64,
     pub video_height: AtomicU64,
     pub audio_sample_rate: AtomicU64,
     pub audio_channels: AtomicU64,
+    // Timestamp tracking
+    pub first_video_timestamp_us: AtomicI64,
+    // Audio sample counter for precise timing
+    pub audio_total_samples: AtomicU64,
 }
 
 // WhepClient intentionally does NOT implement Send.
@@ -59,12 +60,9 @@ pub struct CallbackContext {
 // Use #[tokio::main(flavor = "current_thread")] to ensure single-threaded execution.
 
 impl WhepClient {
-    /// Create a new WHEP client with output directory for frame data
-    pub fn new(whep_url: &str, output_dir: PathBuf) -> Result<Self> {
+    /// Create a new WHEP client
+    pub fn new(whep_url: &str) -> Result<Self> {
         let http_client = reqwest::Client::builder().build()?;
-
-        // Create output directory if it doesn't exist
-        fs::create_dir_all(&output_dir)?;
 
         Ok(Self {
             whep_url: whep_url.to_string(),
@@ -75,7 +73,6 @@ impl WhepClient {
             callback_context: None,
             ice_candidate_rx: None,
             end_of_candidates_sent: false,
-            output_dir,
         })
     }
 
@@ -100,27 +97,22 @@ impl WhepClient {
         }
         self.peer_connection = pc;
 
-        // Set up callback context with ICE candidate channel and file output
+        // Set up callback context with ICE candidate channel and MKV output
         let (ice_tx, ice_rx) = mpsc::channel();
 
-        // Create output files
-        let video_file_path = self.output_dir.join("video.yuv");
-        let audio_file_path = self.output_dir.join("audio.pcm");
-        let video_file = File::create(&video_file_path)?;
-        let audio_file = File::create(&audio_file_path)?;
-        info!("Output files: {:?}, {:?}", video_file_path, audio_file_path);
-
+        // MKV writer will be initialized on first frame when we know video dimensions
         let ctx = Box::new(CallbackContext {
             video_frame_count: AtomicU64::new(0),
             audio_frame_count: AtomicU64::new(0),
             ice_gathering_complete: AtomicBool::new(false),
             ice_candidate_tx: ice_tx,
-            video_file: Mutex::new(Some(video_file)),
-            audio_file: Mutex::new(Some(audio_file)),
+            mkv_writer: Mutex::new(None),
             video_width: AtomicU64::new(0),
             video_height: AtomicU64::new(0),
             audio_sample_rate: AtomicU64::new(0),
             audio_channels: AtomicU64::new(0),
+            first_video_timestamp_us: AtomicI64::new(-1),
+            audio_total_samples: AtomicU64::new(0),
         });
         self.callback_context = Some(ctx);
         self.ice_candidate_rx = Some(ice_rx);
@@ -213,7 +205,7 @@ impl WhepClient {
             info!("ICE connection state changed: {}", state_str);
         }
 
-        // Video frame callback - writes I420 YUV data to file
+        // Video frame callback - writes I420 YUV data to MKV
         unsafe extern "C" fn on_video_frame(
             user_data: *mut c_void,
             width: i32,
@@ -232,61 +224,95 @@ impl WhepClient {
             let ctx = &*(user_data as *const CallbackContext);
             let count = ctx.video_frame_count.fetch_add(1, Ordering::Relaxed) + 1;
 
-            // Store metadata on first frame
+            // Store metadata and initialize MKV writer on first frame
             if count == 1 {
                 ctx.video_width.store(width as u64, Ordering::Relaxed);
                 ctx.video_height.store(height as u64, Ordering::Relaxed);
-                info!(
-                    "Video format detected: {}x{} (y_stride={}, u_stride={}, v_stride={})",
+                ctx.first_video_timestamp_us.store(timestamp_us, Ordering::Relaxed);
+                eprintln!(
+                    "[INFO] Video format detected: {}x{} (y_stride={}, u_stride={}, v_stride={})",
                     width, height, y_stride, u_stride, v_stride
                 );
+
+                // Initialize MKV writer with default audio params (will be updated on first audio frame if different)
+                let config = MkvConfig {
+                    video_width: width as u32,
+                    video_height: height as u32,
+                    audio_sample_rate: 48000,
+                    audio_channels: 2,
+                };
+                if let Ok(mut guard) = ctx.mkv_writer.lock() {
+                    match MkvWriter::new(BufWriter::new(std::io::stdout()), config) {
+                        Ok(writer) => {
+                            *guard = Some(writer);
+                            eprintln!("[INFO] MKV writer initialized, streaming to stdout");
+                        }
+                        Err(e) => {
+                            eprintln!("[ERROR] Failed to initialize MKV writer: {}", e);
+                        }
+                    }
+                }
             }
 
-            // Write I420 YUV data to file
-            // I420 format: Y plane (width*height) + U plane (width/2 * height/2) + V plane (width/2 * height/2)
-            if let Ok(mut guard) = ctx.video_file.lock() {
-                if let Some(ref mut file) = *guard {
-                    let w = width as usize;
-                    let h = height as usize;
-                    let y_stride_usize = y_stride as usize;
-                    let u_stride_usize = u_stride as usize;
-                    let v_stride_usize = v_stride as usize;
+            // Build I420 frame data (packed, no stride padding)
+            let w = width as usize;
+            let h = height as usize;
+            let y_stride_usize = y_stride as usize;
+            let u_stride_usize = u_stride as usize;
+            let v_stride_usize = v_stride as usize;
 
-                    // Write Y plane (row by row to handle stride)
-                    for row in 0..h {
-                        let row_start = row * y_stride_usize;
-                        let row_data = std::slice::from_raw_parts(y_data.add(row_start), w);
-                        let _ = file.write_all(row_data);
-                    }
+            let y_size = w * h;
+            let uv_w = w / 2;
+            let uv_h = h / 2;
+            let uv_size = uv_w * uv_h;
+            let frame_size = y_size + uv_size * 2;
 
-                    // Write U plane (half width, half height)
-                    let uv_h = h / 2;
-                    let uv_w = w / 2;
-                    for row in 0..uv_h {
-                        let row_start = row * u_stride_usize;
-                        let row_data = std::slice::from_raw_parts(u_data.add(row_start), uv_w);
-                        let _ = file.write_all(row_data);
-                    }
+            let mut frame_data = Vec::with_capacity(frame_size);
 
-                    // Write V plane (half width, half height)
-                    for row in 0..uv_h {
-                        let row_start = row * v_stride_usize;
-                        let row_data = std::slice::from_raw_parts(v_data.add(row_start), uv_w);
-                        let _ = file.write_all(row_data);
+            // Copy Y plane (row by row to handle stride)
+            for row in 0..h {
+                let row_start = row * y_stride_usize;
+                let row_data = std::slice::from_raw_parts(y_data.add(row_start), w);
+                frame_data.extend_from_slice(row_data);
+            }
+
+            // Copy U plane (half width, half height)
+            for row in 0..uv_h {
+                let row_start = row * u_stride_usize;
+                let row_data = std::slice::from_raw_parts(u_data.add(row_start), uv_w);
+                frame_data.extend_from_slice(row_data);
+            }
+
+            // Copy V plane (half width, half height)
+            for row in 0..uv_h {
+                let row_start = row * v_stride_usize;
+                let row_data = std::slice::from_raw_parts(v_data.add(row_start), uv_w);
+                frame_data.extend_from_slice(row_data);
+            }
+
+            // Calculate timestamp relative to first frame
+            let first_ts = ctx.first_video_timestamp_us.load(Ordering::Relaxed);
+            let timestamp_ms = (timestamp_us - first_ts) / 1000;
+
+            // Write to MKV (all I420 frames are keyframes for uncompressed video)
+            if let Ok(mut guard) = ctx.mkv_writer.lock() {
+                if let Some(ref mut writer) = *guard {
+                    if let Err(e) = writer.write_video_frame(&frame_data, timestamp_ms, true) {
+                        eprintln!("[ERROR] Failed to write video frame: {}", e);
                     }
                 }
             }
 
             // Log every 30 frames (approximately once per second at 30fps)
             if count % 30 == 1 {
-                trace!(
-                    "Video frame #{}: {}x{} ts={}us",
-                    count, width, height, timestamp_us
+                eprintln!(
+                    "[TRACE] Video frame #{}: {}x{} ts={}ms",
+                    count, width, height, timestamp_ms
                 );
             }
         }
 
-        // Audio frame callback - writes PCM S16LE interleaved data to file
+        // Audio frame callback - writes PCM S16LE interleaved data to MKV
         unsafe extern "C" fn on_audio_frame(
             user_data: *mut c_void,
             sample_rate: i32,
@@ -298,38 +324,53 @@ impl WhepClient {
                 return;
             }
             let ctx = &*(user_data as *const CallbackContext);
+
+            // Check if MKV writer is initialized (waits for first video frame)
+            let first_video_ts = ctx.first_video_timestamp_us.load(Ordering::Relaxed);
+            if first_video_ts < 0 {
+                // Video not started yet, discard audio frames but don't count them
+                return;
+            }
+
             let count = ctx.audio_frame_count.fetch_add(1, Ordering::Relaxed) + 1;
 
             // Store metadata on first frame
             if count == 1 {
                 ctx.audio_sample_rate.store(sample_rate as u64, Ordering::Relaxed);
                 ctx.audio_channels.store(num_channels as u64, Ordering::Relaxed);
-                info!(
-                    "Audio format detected: {}Hz {}ch ({} samples/channel)",
+                eprintln!(
+                    "[INFO] Audio format detected: {}Hz {}ch ({} samples/channel)",
                     sample_rate, num_channels, samples_per_channel
                 );
             }
 
-            // Write PCM S16LE interleaved data to file
-            // Data layout: [L0, R0, L1, R1, ...] for stereo (interleaved)
-            if let Ok(mut guard) = ctx.audio_file.lock() {
-                if let Some(ref mut file) = *guard {
-                    let total_samples = samples_per_channel * num_channels;
-                    let audio_data = std::slice::from_raw_parts(data, total_samples);
-                    // Convert i16 slice to bytes (S16LE)
-                    let byte_data = std::slice::from_raw_parts(
-                        audio_data.as_ptr() as *const u8,
-                        total_samples * 2,
-                    );
-                    let _ = file.write_all(byte_data);
+            // Calculate audio timestamp based on accumulated samples
+            // This ensures audio timestamp increases at the correct rate
+            let prev_samples = ctx.audio_total_samples.fetch_add(samples_per_channel as u64, Ordering::Relaxed);
+            let timestamp_ms = (prev_samples as i64 * 1000) / sample_rate as i64;
+
+            // Convert PCM data to bytes (S16LE)
+            let total_samples = samples_per_channel * num_channels;
+            let audio_data = std::slice::from_raw_parts(data, total_samples);
+            let byte_data = std::slice::from_raw_parts(
+                audio_data.as_ptr() as *const u8,
+                total_samples * 2,
+            );
+
+            // Write to MKV
+            if let Ok(mut guard) = ctx.mkv_writer.lock() {
+                if let Some(ref mut writer) = *guard {
+                    if let Err(e) = writer.write_audio_frame(byte_data, timestamp_ms) {
+                        eprintln!("[ERROR] Failed to write audio frame: {}", e);
+                    }
                 }
             }
 
             // Log every 100 frames (approximately once per second at 48kHz/480 samples)
             if count % 100 == 1 {
-                trace!(
-                    "Audio frame #{}: {}Hz {}ch {} samples",
-                    count, sample_rate, num_channels, samples_per_channel
+                eprintln!(
+                    "[TRACE] Audio frame #{}: {}Hz {}ch {} samples ts={}ms",
+                    count, sample_rate, num_channels, samples_per_channel, timestamp_ms
                 );
             }
         }
@@ -642,9 +683,9 @@ impl WhepClient {
         Ok(WhepResponse { sdp, resource_url })
     }
 
-    /// Close the connection and write metadata file
+    /// Close the connection
     pub async fn close(&mut self) -> Result<()> {
-        // Write metadata file with frame format info
+        // Log final statistics
         if let Some(ref ctx) = self.callback_context {
             let video_width = ctx.video_width.load(Ordering::Relaxed);
             let video_height = ctx.video_height.load(Ordering::Relaxed);
@@ -653,31 +694,18 @@ impl WhepClient {
             let video_frames = ctx.video_frame_count.load(Ordering::Relaxed);
             let audio_frames = ctx.audio_frame_count.load(Ordering::Relaxed);
 
-            let metadata_path = self.output_dir.join("metadata.txt");
-            let metadata_content = format!(
-                "# WHEP Client Capture Metadata\n\
-                 # Video playback: ffplay -f rawvideo -pix_fmt yuv420p -s {}x{} video.yuv\n\
-                 # Audio playback: ffplay -f s16le -ar {} -ac {} audio.pcm\n\n\
-                 video_width={}\n\
-                 video_height={}\n\
-                 video_frames={}\n\
-                 audio_sample_rate={}\n\
-                 audio_channels={}\n\
-                 audio_frames={}\n",
-                video_width, video_height, audio_sample_rate, audio_channels,
-                video_width, video_height, video_frames,
-                audio_sample_rate, audio_channels, audio_frames
+            eprintln!(
+                "[INFO] Capture complete: {} video frames ({}x{}), {} audio frames ({}Hz {}ch)",
+                video_frames, video_width, video_height,
+                audio_frames, audio_sample_rate, audio_channels
             );
 
-            if let Ok(mut file) = File::create(&metadata_path) {
-                let _ = file.write_all(metadata_content.as_bytes());
-                info!("Metadata written to {:?}", metadata_path);
+            // Flush MKV writer
+            if let Ok(mut guard) = ctx.mkv_writer.lock() {
+                if let Some(ref mut writer) = *guard {
+                    let _ = writer.flush();
+                }
             }
-
-            info!(
-                "Capture complete: {} video frames, {} audio frames",
-                video_frames, audio_frames
-            );
         }
 
         if !self.peer_connection.is_null() {

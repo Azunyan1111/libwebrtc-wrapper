@@ -267,16 +267,20 @@ private:
         // Audio parameters: 48kHz, stereo, 10ms frames
         const int kSampleRate = 48000;
         const size_t kNumChannels = stereo_playout_ ? 2 : 1;
-        const size_t kSamplesPerChannel = kSampleRate / 100;  // 10ms
+        const size_t kSamplesPerChannel = kSampleRate / 100;  // 10ms = 480 samples
         const size_t kTotalSamples = kSamplesPerChannel * kNumChannels;
+        const auto kFrameDuration = std::chrono::microseconds(10000);  // 10ms in microseconds
 
         std::vector<int16_t> audio_buffer(kTotalSamples, 0);
         int64_t elapsed_time_ms = 0;
         int64_t ntp_time_ms = 0;
 
+        auto next_frame_time = std::chrono::steady_clock::now();
+
         while (!stop_playout_thread_) {
-            // Sleep for approximately 10ms
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            // Wait until next frame time
+            next_frame_time += kFrameDuration;
+            std::this_thread::sleep_until(next_frame_time);
 
             webrtc::AudioTransport* transport = nullptr;
             {

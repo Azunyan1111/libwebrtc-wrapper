@@ -1,0 +1,429 @@
+//! MKV (Matroska) writer for streaming video/audio to stdout
+//!
+//! Supports:
+//! - V_UNCOMPRESSED (I420 YUV) video
+//! - A_PCM/INT/LIT (PCM S16LE) audio
+//!
+//! Uses unknown-size encoding for Segment and Cluster to enable streaming output.
+
+use std::io::{Result, Write};
+
+/// EBML Element IDs
+mod ebml_ids {
+    // EBML Header
+    pub const EBML: &[u8] = &[0x1A, 0x45, 0xDF, 0xA3];
+    pub const EBML_VERSION: &[u8] = &[0x42, 0x86];
+    pub const EBML_READ_VERSION: &[u8] = &[0x42, 0xF7];
+    pub const EBML_MAX_ID_LENGTH: &[u8] = &[0x42, 0xF2];
+    pub const EBML_MAX_SIZE_LENGTH: &[u8] = &[0x42, 0xF3];
+    pub const DOC_TYPE: &[u8] = &[0x42, 0x82];
+    pub const DOC_TYPE_VERSION: &[u8] = &[0x42, 0x87];
+    pub const DOC_TYPE_READ_VERSION: &[u8] = &[0x42, 0x85];
+
+    // Segment
+    pub const SEGMENT: &[u8] = &[0x18, 0x53, 0x80, 0x67];
+
+    // Info
+    pub const INFO: &[u8] = &[0x15, 0x49, 0xA9, 0x66];
+    pub const TIMESTAMP_SCALE: &[u8] = &[0x2A, 0xD7, 0xB1];
+    pub const MUXING_APP: &[u8] = &[0x4D, 0x80];
+    pub const WRITING_APP: &[u8] = &[0x57, 0x41];
+
+    // Tracks
+    pub const TRACKS: &[u8] = &[0x16, 0x54, 0xAE, 0x6B];
+    pub const TRACK_ENTRY: &[u8] = &[0xAE];
+    pub const TRACK_NUMBER: &[u8] = &[0xD7];
+    pub const TRACK_UID: &[u8] = &[0x73, 0xC5];
+    pub const TRACK_TYPE: &[u8] = &[0x83];
+    pub const CODEC_ID: &[u8] = &[0x86];
+    pub const CODEC_PRIVATE: &[u8] = &[0x63, 0xA2];
+
+    // Video track
+    pub const VIDEO: &[u8] = &[0xE0];
+    pub const PIXEL_WIDTH: &[u8] = &[0xB0];
+    pub const PIXEL_HEIGHT: &[u8] = &[0xBA];
+    pub const COLOUR_SPACE: &[u8] = &[0x2E, 0xB5, 0x24];
+
+    // Audio track
+    pub const AUDIO: &[u8] = &[0xE1];
+    pub const SAMPLING_FREQUENCY: &[u8] = &[0xB5];
+    pub const CHANNELS: &[u8] = &[0x9F];
+    pub const BIT_DEPTH: &[u8] = &[0x62, 0x64];
+
+    // Cluster
+    pub const CLUSTER: &[u8] = &[0x1F, 0x43, 0xB6, 0x75];
+    pub const TIMESTAMP: &[u8] = &[0xE7];
+    pub const SIMPLE_BLOCK: &[u8] = &[0xA3];
+}
+
+/// Track types
+const TRACK_TYPE_VIDEO: u8 = 1;
+const TRACK_TYPE_AUDIO: u8 = 2;
+
+/// Track numbers
+const VIDEO_TRACK_NUMBER: u8 = 1;
+const AUDIO_TRACK_NUMBER: u8 = 2;
+
+/// Unknown size marker (8 bytes)
+const UNKNOWN_SIZE: &[u8] = &[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+
+/// Cluster duration threshold in milliseconds (5 seconds)
+const CLUSTER_DURATION_MS: i64 = 5000;
+
+/// MKV configuration
+#[derive(Clone, Debug)]
+pub struct MkvConfig {
+    pub video_width: u32,
+    pub video_height: u32,
+    pub audio_sample_rate: u32,
+    pub audio_channels: u32,
+}
+
+/// MKV Writer for streaming output
+pub struct MkvWriter<W: Write> {
+    writer: W,
+    config: MkvConfig,
+    cluster_start_time: Option<i64>,
+    header_written: bool,
+}
+
+impl<W: Write> MkvWriter<W> {
+    /// Create a new MKV writer
+    pub fn new(writer: W, config: MkvConfig) -> Result<Self> {
+        let mut mkv = Self {
+            writer,
+            config,
+            cluster_start_time: None,
+            header_written: false,
+        };
+        mkv.write_header()?;
+        Ok(mkv)
+    }
+
+    /// Write the MKV header (EBML header, Segment, Info, Tracks)
+    fn write_header(&mut self) -> Result<()> {
+        self.write_ebml_header()?;
+        self.write_segment_start()?;
+        self.write_info()?;
+        self.write_tracks()?;
+        self.header_written = true;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Write EBML header
+    fn write_ebml_header(&mut self) -> Result<()> {
+        let mut header_data = Vec::new();
+
+        // EBMLVersion = 1
+        write_ebml_element(&mut header_data, ebml_ids::EBML_VERSION, &encode_uint(1))?;
+        // EBMLReadVersion = 1
+        write_ebml_element(&mut header_data, ebml_ids::EBML_READ_VERSION, &encode_uint(1))?;
+        // EBMLMaxIDLength = 4
+        write_ebml_element(&mut header_data, ebml_ids::EBML_MAX_ID_LENGTH, &encode_uint(4))?;
+        // EBMLMaxSizeLength = 8
+        write_ebml_element(&mut header_data, ebml_ids::EBML_MAX_SIZE_LENGTH, &encode_uint(8))?;
+        // DocType = "matroska"
+        write_ebml_element(&mut header_data, ebml_ids::DOC_TYPE, b"matroska")?;
+        // DocTypeVersion = 4
+        write_ebml_element(&mut header_data, ebml_ids::DOC_TYPE_VERSION, &encode_uint(4))?;
+        // DocTypeReadVersion = 2
+        write_ebml_element(&mut header_data, ebml_ids::DOC_TYPE_READ_VERSION, &encode_uint(2))?;
+
+        write_ebml_element(&mut self.writer, ebml_ids::EBML, &header_data)?;
+        Ok(())
+    }
+
+    /// Write Segment start with unknown size
+    fn write_segment_start(&mut self) -> Result<()> {
+        self.writer.write_all(ebml_ids::SEGMENT)?;
+        self.writer.write_all(UNKNOWN_SIZE)?;
+        Ok(())
+    }
+
+    /// Write Info element
+    fn write_info(&mut self) -> Result<()> {
+        let mut info_data = Vec::new();
+
+        // TimestampScale = 1,000,000 (1ms precision)
+        write_ebml_element(&mut info_data, ebml_ids::TIMESTAMP_SCALE, &encode_uint(1_000_000))?;
+        // MuxingApp
+        write_ebml_element(&mut info_data, ebml_ids::MUXING_APP, b"whep-client")?;
+        // WritingApp
+        write_ebml_element(&mut info_data, ebml_ids::WRITING_APP, b"whep-client")?;
+
+        write_ebml_element(&mut self.writer, ebml_ids::INFO, &info_data)?;
+        Ok(())
+    }
+
+    /// Write Tracks element (Video + Audio)
+    fn write_tracks(&mut self) -> Result<()> {
+        let mut tracks_data = Vec::new();
+
+        // Video track
+        let video_track = self.build_video_track()?;
+        write_ebml_element(&mut tracks_data, ebml_ids::TRACK_ENTRY, &video_track)?;
+
+        // Audio track
+        let audio_track = self.build_audio_track()?;
+        write_ebml_element(&mut tracks_data, ebml_ids::TRACK_ENTRY, &audio_track)?;
+
+        write_ebml_element(&mut self.writer, ebml_ids::TRACKS, &tracks_data)?;
+        Ok(())
+    }
+
+    /// Build video track entry
+    fn build_video_track(&self) -> Result<Vec<u8>> {
+        let mut track = Vec::new();
+
+        // TrackNumber = 1
+        write_ebml_element(&mut track, ebml_ids::TRACK_NUMBER, &encode_uint(VIDEO_TRACK_NUMBER as u64))?;
+        // TrackUID = 1
+        write_ebml_element(&mut track, ebml_ids::TRACK_UID, &encode_uint(1))?;
+        // TrackType = 1 (video)
+        write_ebml_element(&mut track, ebml_ids::TRACK_TYPE, &encode_uint(TRACK_TYPE_VIDEO as u64))?;
+        // CodecID = V_UNCOMPRESSED
+        write_ebml_element(&mut track, ebml_ids::CODEC_ID, b"V_UNCOMPRESSED")?;
+
+        // CodecPrivate: FourCC for I420 (0x30323449 = "I420")
+        let fourcc: [u8; 4] = [0x49, 0x34, 0x32, 0x30]; // "I420" in little-endian
+        write_ebml_element(&mut track, ebml_ids::CODEC_PRIVATE, &fourcc)?;
+
+        // Video element
+        let mut video = Vec::new();
+        write_ebml_element(&mut video, ebml_ids::PIXEL_WIDTH, &encode_uint(self.config.video_width as u64))?;
+        write_ebml_element(&mut video, ebml_ids::PIXEL_HEIGHT, &encode_uint(self.config.video_height as u64))?;
+        // ColourSpace: I420 FourCC
+        write_ebml_element(&mut video, ebml_ids::COLOUR_SPACE, &fourcc)?;
+        write_ebml_element(&mut track, ebml_ids::VIDEO, &video)?;
+
+        Ok(track)
+    }
+
+    /// Build audio track entry
+    fn build_audio_track(&self) -> Result<Vec<u8>> {
+        let mut track = Vec::new();
+
+        // TrackNumber = 2
+        write_ebml_element(&mut track, ebml_ids::TRACK_NUMBER, &encode_uint(AUDIO_TRACK_NUMBER as u64))?;
+        // TrackUID = 2
+        write_ebml_element(&mut track, ebml_ids::TRACK_UID, &encode_uint(2))?;
+        // TrackType = 2 (audio)
+        write_ebml_element(&mut track, ebml_ids::TRACK_TYPE, &encode_uint(TRACK_TYPE_AUDIO as u64))?;
+        // CodecID = A_PCM/INT/LIT (signed integer, little-endian)
+        write_ebml_element(&mut track, ebml_ids::CODEC_ID, b"A_PCM/INT/LIT")?;
+
+        // Audio element
+        let mut audio = Vec::new();
+        write_ebml_element(&mut audio, ebml_ids::SAMPLING_FREQUENCY, &encode_float64(self.config.audio_sample_rate as f64))?;
+        write_ebml_element(&mut audio, ebml_ids::CHANNELS, &encode_uint(self.config.audio_channels as u64))?;
+        // BitDepth = 16
+        write_ebml_element(&mut audio, ebml_ids::BIT_DEPTH, &encode_uint(16))?;
+        write_ebml_element(&mut track, ebml_ids::AUDIO, &audio)?;
+
+        Ok(track)
+    }
+
+    /// Start a new cluster
+    fn start_cluster(&mut self, timestamp_ms: i64) -> Result<()> {
+        // Write Cluster element with unknown size
+        self.writer.write_all(ebml_ids::CLUSTER)?;
+        self.writer.write_all(UNKNOWN_SIZE)?;
+
+        // Write Timestamp
+        write_ebml_element(&mut self.writer, ebml_ids::TIMESTAMP, &encode_uint(timestamp_ms as u64))?;
+
+        self.cluster_start_time = Some(timestamp_ms);
+        Ok(())
+    }
+
+    /// Check if we need to start a new cluster
+    fn maybe_start_new_cluster(&mut self, timestamp_ms: i64, is_keyframe: bool) -> Result<()> {
+        let need_new_cluster = match self.cluster_start_time {
+            None => true, // First frame
+            Some(start) => {
+                let elapsed = timestamp_ms - start;
+                // New cluster on keyframe after threshold, or if elapsed time exceeds threshold
+                (is_keyframe && elapsed > 0) || elapsed >= CLUSTER_DURATION_MS
+            }
+        };
+
+        if need_new_cluster {
+            self.start_cluster(timestamp_ms)?;
+        }
+
+        Ok(())
+    }
+
+    /// Write a video frame
+    pub fn write_video_frame(&mut self, frame: &[u8], timestamp_ms: i64, is_keyframe: bool) -> Result<()> {
+        self.maybe_start_new_cluster(timestamp_ms, is_keyframe)?;
+
+        let relative_ts = self.relative_timestamp(timestamp_ms);
+        self.write_simple_block(VIDEO_TRACK_NUMBER, relative_ts, is_keyframe, frame)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Write an audio frame
+    pub fn write_audio_frame(&mut self, frame: &[u8], timestamp_ms: i64) -> Result<()> {
+        // Audio is never a keyframe in the cluster sense
+        self.maybe_start_new_cluster(timestamp_ms, false)?;
+
+        let relative_ts = self.relative_timestamp(timestamp_ms);
+        // Audio frames are always "keyframes" (independently decodable for PCM)
+        self.write_simple_block(AUDIO_TRACK_NUMBER, relative_ts, true, frame)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Calculate relative timestamp within current cluster
+    fn relative_timestamp(&self, timestamp_ms: i64) -> i16 {
+        let cluster_start = self.cluster_start_time.unwrap_or(0);
+        let relative = timestamp_ms - cluster_start;
+        // Clamp to i16 range
+        relative.clamp(i16::MIN as i64, i16::MAX as i64) as i16
+    }
+
+    /// Write a SimpleBlock
+    fn write_simple_block(&mut self, track_number: u8, relative_ts: i16, is_keyframe: bool, data: &[u8]) -> Result<()> {
+        // SimpleBlock structure:
+        // [Track Number (VINT)] [Relative Timestamp (int16 BE)] [Flags] [Data]
+        let track_vint = encode_vint_value(track_number as u64);
+        let ts_bytes = relative_ts.to_be_bytes();
+        let flags: u8 = if is_keyframe { 0x80 } else { 0x00 };
+
+        let block_size = track_vint.len() + 2 + 1 + data.len();
+        let mut block_data = Vec::with_capacity(block_size);
+        block_data.extend_from_slice(&track_vint);
+        block_data.extend_from_slice(&ts_bytes);
+        block_data.push(flags);
+        block_data.extend_from_slice(data);
+
+        write_ebml_element(&mut self.writer, ebml_ids::SIMPLE_BLOCK, &block_data)?;
+        Ok(())
+    }
+
+    /// Flush the writer
+    pub fn flush(&mut self) -> Result<()> {
+        self.writer.flush()
+    }
+}
+
+// EBML utility functions
+
+/// Encode a value as VINT (variable-length integer for element content)
+fn encode_vint_value(value: u64) -> Vec<u8> {
+    // VINT encoding: the first byte indicates the length
+    // 1xxxxxxx = 1 byte (values 0-127)
+    // 01xxxxxx xxxxxxxx = 2 bytes
+    // etc.
+    if value < 0x80 {
+        vec![0x80 | value as u8]
+    } else if value < 0x4000 {
+        vec![0x40 | (value >> 8) as u8, value as u8]
+    } else if value < 0x20_0000 {
+        vec![
+            0x20 | (value >> 16) as u8,
+            (value >> 8) as u8,
+            value as u8,
+        ]
+    } else if value < 0x1000_0000 {
+        vec![
+            0x10 | (value >> 24) as u8,
+            (value >> 16) as u8,
+            (value >> 8) as u8,
+            value as u8,
+        ]
+    } else {
+        // Larger values need more bytes
+        let mut bytes = Vec::new();
+        let mut v = value;
+        while v > 0 {
+            bytes.push(v as u8);
+            v >>= 8;
+        }
+        bytes.reverse();
+        // Prepend marker based on length
+        let len = bytes.len();
+        if len <= 8 {
+            let marker = 1u8 << (8 - len);
+            if bytes.is_empty() || (bytes[0] & marker) == 0 {
+                bytes.insert(0, marker);
+            } else {
+                bytes.insert(0, 0);
+                bytes[0] = marker >> 1;
+            }
+        }
+        bytes
+    }
+}
+
+/// Encode a size value as VINT for element size field
+fn encode_vint_size(value: u64) -> Vec<u8> {
+    // Size field uses the same encoding as VINT but represents the size
+    encode_vint_value(value)
+}
+
+/// Encode an unsigned integer using minimal bytes
+fn encode_uint(value: u64) -> Vec<u8> {
+    if value == 0 {
+        return vec![0];
+    }
+
+    let mut bytes = Vec::new();
+    let mut v = value;
+    while v > 0 {
+        bytes.push(v as u8);
+        v >>= 8;
+    }
+    bytes.reverse();
+    bytes
+}
+
+/// Encode a 64-bit float (IEEE 754 big-endian)
+fn encode_float64(value: f64) -> Vec<u8> {
+    value.to_be_bytes().to_vec()
+}
+
+/// Write an EBML element (ID + Size + Data)
+fn write_ebml_element<W: Write>(writer: &mut W, id: &[u8], data: &[u8]) -> Result<()> {
+    writer.write_all(id)?;
+    let size = encode_vint_size(data.len() as u64);
+    writer.write_all(&size)?;
+    writer.write_all(data)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_uint() {
+        assert_eq!(encode_uint(0), vec![0]);
+        assert_eq!(encode_uint(1), vec![1]);
+        assert_eq!(encode_uint(127), vec![127]);
+        assert_eq!(encode_uint(128), vec![128]);
+        assert_eq!(encode_uint(255), vec![255]);
+        assert_eq!(encode_uint(256), vec![1, 0]);
+        assert_eq!(encode_uint(1_000_000), vec![0x0F, 0x42, 0x40]);
+    }
+
+    #[test]
+    fn test_encode_vint_value() {
+        // Track number 1 should encode as 0x81
+        assert_eq!(encode_vint_value(1), vec![0x81]);
+        // Track number 2 should encode as 0x82
+        assert_eq!(encode_vint_value(2), vec![0x82]);
+    }
+
+    #[test]
+    fn test_encode_float64() {
+        let bytes = encode_float64(48000.0);
+        assert_eq!(bytes.len(), 8);
+        // Verify it's big-endian IEEE 754
+        let restored = f64::from_be_bytes(bytes.try_into().unwrap());
+        assert_eq!(restored, 48000.0);
+    }
+}
