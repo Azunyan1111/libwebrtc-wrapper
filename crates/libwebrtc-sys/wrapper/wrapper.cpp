@@ -20,8 +20,14 @@
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
 #include "api/create_peerconnection_factory.h"
 #include "api/peer_connection_interface.h"
-#include "api/video_codecs/builtin_video_decoder_factory.h"
-#include "api/video_codecs/builtin_video_encoder_factory.h"
+#include "api/video_codecs/video_encoder_factory.h"
+#include "api/video_codecs/video_decoder_factory.h"
+#include "api/environment/environment.h"
+
+// Forward declarations for codec creation (symbols from libwebrtc.a)
+namespace webrtc {
+std::unique_ptr<VideoDecoder> CreateVp8Decoder(const Environment& env);
+}  // namespace webrtc
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame.h"
 #include "api/media_stream_interface.h"
@@ -33,6 +39,47 @@
 #include "api/video/video_sink_interface.h"
 
 namespace {
+
+// Stub VideoEncoderFactory - returns supported formats for SDP negotiation
+// but does not actually create encoders (receive-only client)
+class StubVideoEncoderFactory : public webrtc::VideoEncoderFactory {
+public:
+    std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
+        std::vector<webrtc::SdpVideoFormat> formats;
+        // Add common video codecs for SDP negotiation
+        formats.push_back(webrtc::SdpVideoFormat("VP8"));
+        formats.push_back(webrtc::SdpVideoFormat("VP9"));
+        formats.push_back(webrtc::SdpVideoFormat("H264"));
+        return formats;
+    }
+    std::unique_ptr<webrtc::VideoEncoder> Create(
+        const webrtc::Environment& env,
+        const webrtc::SdpVideoFormat& format) override {
+        // Not used in receive-only scenario
+        return nullptr;
+    }
+};
+
+// VideoDecoderFactory that creates actual decoders for VP8
+class RealVideoDecoderFactory : public webrtc::VideoDecoderFactory {
+public:
+    std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
+        std::vector<webrtc::SdpVideoFormat> formats;
+        formats.push_back(webrtc::SdpVideoFormat("VP8"));
+        formats.push_back(webrtc::SdpVideoFormat("VP9"));
+        formats.push_back(webrtc::SdpVideoFormat("H264"));
+        return formats;
+    }
+    std::unique_ptr<webrtc::VideoDecoder> Create(
+        const webrtc::Environment& env,
+        const webrtc::SdpVideoFormat& format) override {
+        if (format.name == "VP8") {
+            return webrtc::CreateVp8Decoder(env);
+        }
+        // VP9/H264 decoders not available in LiveKit's libwebrtc.a
+        return nullptr;
+    }
+};
 
 // Helper to duplicate a string for C API
 char* strdup_wrapper(const std::string& s) {
@@ -662,8 +709,8 @@ WebrtcPeerConnectionFactory* webrtc_factory_create(void) {
         dummy_adm,  // Use dummy ADM to disable speaker output
         webrtc::CreateBuiltinAudioEncoderFactory(),
         webrtc::CreateBuiltinAudioDecoderFactory(),
-        webrtc::CreateBuiltinVideoEncoderFactory(),
-        webrtc::CreateBuiltinVideoDecoderFactory(),
+        std::make_unique<StubVideoEncoderFactory>(),
+        std::make_unique<RealVideoDecoderFactory>(),
         nullptr,  // audio_mixer
         nullptr   // audio_processing
     );

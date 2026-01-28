@@ -1,0 +1,46 @@
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    build-essential \
+    pkg-config \
+    libssl-dev \
+    clang \
+    unzip \
+    libc++-dev \
+    libc++abi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# X11 libraries for WebRTC
+RUN apt-get update && apt-get install -y \
+    libx11-dev \
+    libxext-dev \
+    libxrandr-dev \
+    libxcomposite-dev \
+    libxdamage-dev \
+    libxtst-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /workspace
+
+# Download LiveKit WebRTC library for Linux x64
+# zip contains linux-x64-release/ directory, rename to webrtc for build.rs
+RUN mkdir -p deps/webrtc/ubuntu22_x64 && \
+    curl -L -o /tmp/webrtc-linux.zip https://github.com/livekit/rust-sdks/releases/download/webrtc-0001d84-2/webrtc-linux-x64-release.zip && \
+    unzip /tmp/webrtc-linux.zip -d /tmp/ && \
+    mv /tmp/linux-x64-release deps/webrtc/ubuntu22_x64/webrtc && \
+    rm /tmp/webrtc-linux.zip
+
+# Copy source code (excluding deps which we just downloaded)
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+# Build
+RUN cargo build --release
+
+# Output binary location
+RUN ls -la target/release/whep-client
