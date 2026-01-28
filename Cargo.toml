@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/whep-client",
+    "crates/whip-client",
 ]
 
 [workspace.package]
