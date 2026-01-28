@@ -18,6 +18,7 @@ use anyhow::Result;
 struct AppConfig {
     whep_url: String,
     debug: bool,
+    debug_libwebrtc: bool,
 }
 
 /// Parse command line arguments
@@ -29,6 +30,7 @@ fn parse_args() -> AppConfig {
 
     let mut whep_url = default_url;
     let mut debug = false;
+    let mut debug_libwebrtc = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -41,7 +43,8 @@ fn parse_args() -> AppConfig {
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  -h, --help          Show this help message");
-                eprintln!("  -d, --debug         Enable debug logging");
+                eprintln!("  -d, --debug         Enable debug logging (this project)");
+                eprintln!("  -dlibwebrtc         Enable libwebrtc debug logging");
                 eprintln!();
                 eprintln!("Output: MKV (Matroska) format to stdout");
                 eprintln!("  Video: V_UNCOMPRESSED (I420 YUV)");
@@ -62,6 +65,10 @@ fn parse_args() -> AppConfig {
                 debug = true;
                 i += 1;
             }
+            "-dlibwebrtc" => {
+                debug_libwebrtc = true;
+                i += 1;
+            }
             arg if !arg.starts_with('-') => {
                 whep_url = arg.to_string();
                 i += 1;
@@ -73,11 +80,15 @@ fn parse_args() -> AppConfig {
         }
     }
 
-    AppConfig { whep_url, debug }
+    AppConfig {
+        whep_url,
+        debug,
+        debug_libwebrtc,
+    }
 }
 
-fn init_tracing(debug: bool) {
-    if !debug {
+fn init_tracing(debug_libwebrtc: bool) {
+    if !debug_libwebrtc {
         return;
     }
 
@@ -95,7 +106,7 @@ async fn main() -> Result<()> {
     eprintln!("[INFO] WHEP Client starting...");
 
     let config = parse_args();
-    init_tracing(config.debug);
+    init_tracing(config.debug_libwebrtc);
 
     eprintln!("[INFO] Connecting to WHEP endpoint: {}", config.whep_url);
     eprintln!("[INFO] MKV output will be streamed to stdout");
