@@ -15,14 +15,20 @@ mod whep;
 
 use anyhow::Result;
 
+struct AppConfig {
+    whep_url: String,
+    debug: bool,
+}
+
 /// Parse command line arguments
 /// Returns whep_url
-fn parse_args() -> String {
+fn parse_args() -> AppConfig {
     let args: Vec<String> = std::env::args().collect();
 
     let default_url = "https://customer-2y2pi15b1mgfooko.cloudflarestream.com/e94a1943c1b42fef532875db0673477c/webRTC/play".to_string();
 
     let mut whep_url = default_url;
+    let mut debug = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -30,11 +36,12 @@ fn parse_args() -> String {
             "-h" | "--help" => {
                 eprintln!("WHEP Client - WebRTC-HTTP Egress Protocol client");
                 eprintln!();
-                eprintln!("Usage: whep-client [WHEP_URL] > output.mkv");
+                eprintln!("Usage: whep-client [options] [WHEP_URL] > output.mkv");
                 eprintln!("       whep-client [WHEP_URL] | ffplay -f matroska -i -");
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  -h, --help          Show this help message");
+                eprintln!("  -d, --debug         Enable debug logging");
                 eprintln!();
                 eprintln!("Output: MKV (Matroska) format to stdout");
                 eprintln!("  Video: V_UNCOMPRESSED (I420 YUV)");
@@ -51,6 +58,10 @@ fn parse_args() -> String {
                 eprintln!("  whep-client https://example.com/whep > output.mkv && ffprobe output.mkv");
                 std::process::exit(0);
             }
+            "-d" | "--debug" => {
+                debug = true;
+                i += 1;
+            }
             arg if !arg.starts_with('-') => {
                 whep_url = arg.to_string();
                 i += 1;
@@ -62,7 +73,18 @@ fn parse_args() -> String {
         }
     }
 
-    whep_url
+    AppConfig { whep_url, debug }
+}
+
+fn init_tracing(debug: bool) {
+    if !debug {
+        return;
+    }
+
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
 }
 
 // Use current_thread runtime to prevent WebRTC raw pointers from being moved across threads.
@@ -72,12 +94,13 @@ async fn main() -> Result<()> {
     // All logs go to stderr (stdout is reserved for MKV output)
     eprintln!("[INFO] WHEP Client starting...");
 
-    let whep_url = parse_args();
+    let config = parse_args();
+    init_tracing(config.debug);
 
-    eprintln!("[INFO] Connecting to WHEP endpoint: {}", whep_url);
+    eprintln!("[INFO] Connecting to WHEP endpoint: {}", config.whep_url);
     eprintln!("[INFO] MKV output will be streamed to stdout");
 
-    let mut client = whep::WhepClient::new(&whep_url)?;
+    let mut client = whep::WhepClient::new(&config.whep_url, config.debug)?;
     client.connect().await?;
 
     eprintln!("[INFO] Connected. Receiving frames (Press Ctrl+C to stop)...");

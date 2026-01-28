@@ -8,6 +8,7 @@
 /libwebrtc/
 webrtc.*.tar.gz
 whep-client-ubuntu
+test_verify/
 
 # Test output (generated media files)
 /test_output/

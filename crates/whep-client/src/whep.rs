@@ -10,6 +10,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Mutex;
+use std::time::{Duration as StdDuration, Instant};
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -31,6 +32,7 @@ pub struct WhepClient {
     callback_context: Option<Box<CallbackContext>>,
     ice_candidate_rx: Option<Receiver<IceCandidate>>,
     end_of_candidates_sent: bool,
+    debug: bool,
 }
 
 use std::sync::atomic::Ordering;
@@ -42,6 +44,7 @@ pub struct CallbackContext {
     pub audio_frame_count: AtomicU64,
     pub ice_gathering_complete: AtomicBool,
     pub ice_candidate_tx: Sender<IceCandidate>,
+    pub debug_mode: AtomicBool,
     // MKV writer for stdout output
     pub mkv_writer: Mutex<Option<MkvWriter<BufWriter<Stdout>>>>,
     // Metadata storage (set on first frame)
@@ -53,6 +56,8 @@ pub struct CallbackContext {
     pub first_video_timestamp_us: AtomicI64,
     // Audio sample counter for precise timing
     pub audio_total_samples: AtomicU64,
+    pub last_video_timestamp_ms: AtomicI64,
+    pub last_audio_timestamp_ms: AtomicI64,
 }
 
 // WhepClient intentionally does NOT implement Send.
@@ -61,7 +66,7 @@ pub struct CallbackContext {
 
 impl WhepClient {
     /// Create a new WHEP client
-    pub fn new(whep_url: &str) -> Result<Self> {
+    pub fn new(whep_url: &str, debug: bool) -> Result<Self> {
         let http_client = reqwest::Client::builder().build()?;
 
         Ok(Self {
@@ -73,6 +78,7 @@ impl WhepClient {
             callback_context: None,
             ice_candidate_rx: None,
             end_of_candidates_sent: false,
+            debug,
         })
     }
 
@@ -106,6 +112,7 @@ impl WhepClient {
             audio_frame_count: AtomicU64::new(0),
             ice_gathering_complete: AtomicBool::new(false),
             ice_candidate_tx: ice_tx,
+            debug_mode: AtomicBool::new(self.debug),
             mkv_writer: Mutex::new(None),
             video_width: AtomicU64::new(0),
             video_height: AtomicU64::new(0),
@@ -113,6 +120,8 @@ impl WhepClient {
             audio_channels: AtomicU64::new(0),
             first_video_timestamp_us: AtomicI64::new(-1),
             audio_total_samples: AtomicU64::new(0),
+            last_video_timestamp_ms: AtomicI64::new(-1),
+            last_audio_timestamp_ms: AtomicI64::new(-1),
         });
         self.callback_context = Some(ctx);
         self.ice_candidate_rx = Some(ice_rx);
@@ -293,13 +302,40 @@ impl WhepClient {
             // Calculate timestamp relative to first frame
             let first_ts = ctx.first_video_timestamp_us.load(Ordering::Relaxed);
             let timestamp_ms = (timestamp_us - first_ts) / 1000;
+            let prev_ts = ctx
+                .last_video_timestamp_ms
+                .swap(timestamp_ms, Ordering::Relaxed);
+
+            if ctx.debug_mode.load(Ordering::Relaxed) && prev_ts >= 0 {
+                let delta = timestamp_ms - prev_ts;
+                if delta < 0 || delta > 200 {
+                    eprintln!(
+                        "[DEBUG] Video timestamp jump: prev={}ms current={}ms delta={}ms",
+                        prev_ts, timestamp_ms, delta
+                    );
+                }
+            }
 
             // Write to MKV (all I420 frames are keyframes for uncompressed video)
+            let debug_mode = ctx.debug_mode.load(Ordering::Relaxed);
+            let write_start = if debug_mode { Some(Instant::now()) } else { None };
             if let Ok(mut guard) = ctx.mkv_writer.lock() {
                 if let Some(ref mut writer) = *guard {
                     if let Err(e) = writer.write_video_frame(&frame_data, timestamp_ms, true) {
                         eprintln!("[ERROR] Failed to write video frame: {}", e);
                     }
+                }
+            } else if debug_mode {
+                eprintln!("[DEBUG] MKV writer lock failed for video frame");
+            }
+            if let Some(start) = write_start {
+                let elapsed = start.elapsed();
+                if elapsed >= StdDuration::from_millis(50) {
+                    eprintln!(
+                        "[DEBUG] Video write slow: {}ms (frame #{})",
+                        elapsed.as_millis(),
+                        count
+                    );
                 }
             }
 
@@ -309,6 +345,18 @@ impl WhepClient {
                     "[TRACE] Video frame #{}: {}x{} ts={}ms",
                     count, width, height, timestamp_ms
                 );
+                if ctx.debug_mode.load(Ordering::Relaxed) {
+                    let audio_ts = ctx.last_audio_timestamp_ms.load(Ordering::Relaxed);
+                    let av_diff = if audio_ts >= 0 {
+                        timestamp_ms - audio_ts
+                    } else {
+                        0
+                    };
+                    eprintln!(
+                        "[DEBUG] AV sync: video_ts={}ms audio_ts={}ms diff={}ms",
+                        timestamp_ms, audio_ts, av_diff
+                    );
+                }
             }
         }
 
@@ -348,6 +396,19 @@ impl WhepClient {
             // This ensures audio timestamp increases at the correct rate
             let prev_samples = ctx.audio_total_samples.fetch_add(samples_per_channel as u64, Ordering::Relaxed);
             let timestamp_ms = (prev_samples as i64 * 1000) / sample_rate as i64;
+            let prev_ts = ctx
+                .last_audio_timestamp_ms
+                .swap(timestamp_ms, Ordering::Relaxed);
+            if ctx.debug_mode.load(Ordering::Relaxed) && prev_ts >= 0 {
+                let expected = (samples_per_channel as i64 * 1000) / sample_rate as i64;
+                let delta = timestamp_ms - prev_ts;
+                if delta < 0 || delta > expected * 3 {
+                    eprintln!(
+                        "[DEBUG] Audio timestamp jump: prev={}ms current={}ms delta={}ms (expected ~{}ms)",
+                        prev_ts, timestamp_ms, delta, expected
+                    );
+                }
+            }
 
             // Convert PCM data to bytes (S16LE)
             let total_samples = samples_per_channel * num_channels;
@@ -358,11 +419,25 @@ impl WhepClient {
             );
 
             // Write to MKV
+            let debug_mode = ctx.debug_mode.load(Ordering::Relaxed);
+            let write_start = if debug_mode { Some(Instant::now()) } else { None };
             if let Ok(mut guard) = ctx.mkv_writer.lock() {
                 if let Some(ref mut writer) = *guard {
                     if let Err(e) = writer.write_audio_frame(byte_data, timestamp_ms) {
                         eprintln!("[ERROR] Failed to write audio frame: {}", e);
                     }
+                }
+            } else if debug_mode {
+                eprintln!("[DEBUG] MKV writer lock failed for audio frame");
+            }
+            if let Some(start) = write_start {
+                let elapsed = start.elapsed();
+                if elapsed >= StdDuration::from_millis(50) {
+                    eprintln!(
+                        "[DEBUG] Audio write slow: {}ms (frame #{})",
+                        elapsed.as_millis(),
+                        count
+                    );
                 }
             }
 
@@ -372,6 +447,18 @@ impl WhepClient {
                     "[TRACE] Audio frame #{}: {}Hz {}ch {} samples ts={}ms",
                     count, sample_rate, num_channels, samples_per_channel, timestamp_ms
                 );
+                if ctx.debug_mode.load(Ordering::Relaxed) {
+                    let video_ts = ctx.last_video_timestamp_ms.load(Ordering::Relaxed);
+                    let av_diff = if video_ts >= 0 {
+                        video_ts - timestamp_ms
+                    } else {
+                        0
+                    };
+                    eprintln!(
+                        "[DEBUG] AV sync: video_ts={}ms audio_ts={}ms diff={}ms",
+                        video_ts, timestamp_ms, av_diff
+                    );
+                }
             }
         }
 
@@ -484,6 +571,10 @@ impl WhepClient {
 
         info!("Connection established. Receiving frames...");
 
+        let mut last_debug_log = Instant::now();
+        let mut last_video_count = 0u64;
+        let mut last_audio_count = 0u64;
+
         // Keep running until interrupted
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -506,6 +597,41 @@ impl WhepClient {
                 let video_count = ctx.video_frame_count.load(Ordering::Relaxed);
                 let audio_count = ctx.audio_frame_count.load(Ordering::Relaxed);
                 debug!("Frame stats: video={}, audio={}", video_count, audio_count);
+
+                if self.debug && last_debug_log.elapsed() >= StdDuration::from_secs(5) {
+                    let last_video_ts = ctx.last_video_timestamp_ms.load(Ordering::Relaxed);
+                    let last_audio_ts = ctx.last_audio_timestamp_ms.load(Ordering::Relaxed);
+                    let av_diff = if last_video_ts >= 0 && last_audio_ts >= 0 {
+                        last_video_ts - last_audio_ts
+                    } else {
+                        -1
+                    };
+                    let video_delta = video_count.saturating_sub(last_video_count);
+                    let audio_delta = audio_count.saturating_sub(last_audio_count);
+
+                    eprintln!(
+                        "[DEBUG] Frame stats: video={} (+{}), audio={} (+{}), last_video_ts={}ms, last_audio_ts={}ms, av_diff={}ms",
+                        video_count,
+                        video_delta,
+                        audio_count,
+                        audio_delta,
+                        last_video_ts,
+                        last_audio_ts,
+                        av_diff
+                    );
+
+                    if video_delta == 0 && audio_delta == 0 {
+                        eprintln!("[WARN] No audio/video frames in last 5s");
+                    } else if video_delta == 0 {
+                        eprintln!("[WARN] Video frames stalled for 5s");
+                    } else if audio_delta == 0 {
+                        eprintln!("[WARN] Audio frames stalled for 5s");
+                    }
+
+                    last_video_count = video_count;
+                    last_audio_count = audio_count;
+                    last_debug_log = Instant::now();
+                }
             }
         }
 
@@ -599,10 +725,9 @@ impl WhepClient {
         };
 
         if let Err(e) = self.send_end_of_candidates(&resource_url).await {
-            warn!("Failed to send end-of-candidates: {}", e);
-        } else {
-            self.end_of_candidates_sent = true;
+            warn!("Failed to send end-of-candidates (will not retry): {}", e);
         }
+        self.end_of_candidates_sent = true;
     }
 
     /// Send end-of-candidates indication per RFC 8840
