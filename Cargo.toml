@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/libwebrtc-sys",
     "crates/whep-client",
 ]
 
@@ -12,8 +11,8 @@ license = "MIT"
 repository = "https://github.com/Azunyan1111/libwebrtc-wrapper"
 
 [workspace.dependencies]
-# Internal crates
-libwebrtc-sys = { path = "crates/libwebrtc-sys" }
+# WebRTC (LiveKit)
+libwebrtc = "0.3"
 
 # Build
 cc = "1"

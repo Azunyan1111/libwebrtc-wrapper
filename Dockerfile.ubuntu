@@ -8,9 +8,10 @@ RUN apt-get update && apt-get install -y \
     clang \
     libc++-dev \
     libc++abi-dev \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# X11 libraries for WebRTC
+# X11, GLib, and VA-API libraries for WebRTC
 RUN apt-get update && apt-get install -y \
     libx11-dev \
     libxext-dev \
@@ -18,6 +19,8 @@ RUN apt-get update && apt-get install -y \
     libxcomposite-dev \
     libxdamage-dev \
     libxtst-dev \
+    libglib2.0-dev \
+    libva-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust
@@ -26,15 +29,14 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /workspace
 
-# Copy pre-downloaded WebRTC library for Linux x64
-# Run 'make download-linux-x64' before building this image
-COPY deps/webrtc/linux_x64 deps/webrtc/linux_x64
-
-# Copy source code
+# Copy source code (libwebrtc crate downloads WebRTC automatically)
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Build
+# Build (libwebrtc crate will download and setup WebRTC during build)
+# Use clang++ as the C++ compiler (required for webrtc-sys compatibility)
+ENV CXX=clang++
+ENV CC=clang
 RUN cargo build --release
 
 # Output binary location

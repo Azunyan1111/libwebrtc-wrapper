@@ -1,0 +1,8 @@
+# macOS requires -ObjC linker flag for LiveKit WebRTC Objective-C bindings
+# See: https://github.com/livekit/rust-sdks
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-ObjC"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-ObjC"]

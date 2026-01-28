@@ -1,3 +1,6 @@
 [submodule "libwebrtc"]
 	path = libwebrtc
 	url = https://webrtc.googlesource.com/src
+[submodule "rust-sdks"]
+	path = rust-sdks
+	url = https://github.com/livekit/rust-sdks
