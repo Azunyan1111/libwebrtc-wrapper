@@ -6,7 +6,6 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
     clang \
-    unzip \
     libc++-dev \
     libc++abi-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -27,15 +26,11 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /workspace
 
-# Download LiveKit WebRTC library for Linux x64
-# zip contains linux-x64-release/ directory, rename to webrtc for build.rs
-RUN mkdir -p deps/webrtc/ubuntu22_x64 && \
-    curl -L -o /tmp/webrtc-linux.zip https://github.com/livekit/rust-sdks/releases/download/webrtc-0001d84-2/webrtc-linux-x64-release.zip && \
-    unzip /tmp/webrtc-linux.zip -d /tmp/ && \
-    mv /tmp/linux-x64-release deps/webrtc/ubuntu22_x64/webrtc && \
-    rm /tmp/webrtc-linux.zip
+# Copy pre-downloaded WebRTC library for Linux x64
+# Run 'make download-linux-x64' before building this image
+COPY deps/webrtc/linux_x64 deps/webrtc/linux_x64
 
-# Copy source code (excluding deps which we just downloaded)
+# Copy source code
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 

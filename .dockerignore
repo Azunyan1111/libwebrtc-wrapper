@@ -1,7 +1,11 @@
 target/
 test_output/
 .git/
+# Exclude macOS deps from Docker build (only linux_x64 is needed)
+deps/webrtc/mac_arm64/
 deps/webrtc/crow_macos_arm64/
 deps/webrtc/crow_linux_x64/
+deps/webrtc/ubuntu22_x64/
+deps/webrtc/ubuntu22_x64_full/
 copys/ubuntu-22.04_x86_64/
 ubuntu-24.04_x86_64/

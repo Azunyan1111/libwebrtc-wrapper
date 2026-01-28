@@ -8,16 +8,20 @@ fn main() {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
 
     // Select WebRTC directory based on target
+    // LiveKit rust-sdks release: webrtc-0001d84-2
     let webrtc_subdir = match (target_os.as_str(), target_arch.as_str()) {
-        ("macos", "aarch64") => "crow_macos_arm64",
-        ("linux", "x86_64") => "ubuntu22_x64/webrtc",
+        ("macos", "aarch64") => "mac_arm64",
+        ("linux", "x86_64") => "linux_x64",
         _ => panic!("Unsupported target: {}-{}", target_os, target_arch),
     };
 
     let webrtc_dir = manifest_path
         .join(format!("../../deps/webrtc/{}", webrtc_subdir))
         .canonicalize()
-        .expect(&format!("WebRTC directory not found: deps/webrtc/{}", webrtc_subdir));
+        .expect(&format!(
+            "WebRTC directory not found: deps/webrtc/{}. Run 'make download' first.",
+            webrtc_subdir
+        ));
 
     let include_dir = webrtc_dir.join("include");
     let lib_dir = webrtc_dir.join("lib");
