@@ -1002,3 +1002,113 @@ fn parse_param_value(value: &str) -> Option<String> {
         Some(unquoted)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- split_link_header_value ---
+
+    #[test]
+    fn test_split_link_header_value_single() {
+        let value = r#"<stun:stun.l.google.com:19302>; rel="ice-server""#;
+        let entries = split_link_header_value(value);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], r#"<stun:stun.l.google.com:19302>; rel="ice-server""#);
+    }
+
+    #[test]
+    fn test_split_link_header_value_multiple() {
+        let value = r#"<stun:stun1>; rel="ice-server", <turn:turn1>; rel="ice-server"; username="user"; credential="pass""#;
+        let entries = split_link_header_value(value);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].contains("stun1"));
+        assert!(entries[1].contains("turn1"));
+    }
+
+    #[test]
+    fn test_split_link_header_value_empty() {
+        let entries = split_link_header_value("");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_split_link_header_value_quoted_comma() {
+        // クォート内のカンマは分割しない
+        let value = r#"<stun:stun1>; rel="ice-server, other""#;
+        let entries = split_link_header_value(value);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].contains("ice-server, other"));
+    }
+
+    // --- parse_param_value ---
+
+    #[test]
+    fn test_parse_param_value_quoted() {
+        assert_eq!(parse_param_value(r#""value""#), Some("value".to_string()));
+    }
+
+    #[test]
+    fn test_parse_param_value_unquoted() {
+        assert_eq!(parse_param_value("value"), Some("value".to_string()));
+    }
+
+    #[test]
+    fn test_parse_param_value_empty() {
+        assert_eq!(parse_param_value(""), None);
+        assert_eq!(parse_param_value(r#""""#), None);
+    }
+
+    #[test]
+    fn test_parse_param_value_whitespace() {
+        assert_eq!(parse_param_value("  value  "), Some("value".to_string()));
+        assert_eq!(parse_param_value("  \"quoted\"  "), Some("quoted".to_string()));
+    }
+
+    // --- parse_ice_server_entry ---
+
+    #[test]
+    fn test_parse_ice_server_entry_stun() {
+        let entry = r#"<stun:stun.l.google.com:19302>; rel="ice-server""#;
+        let server = parse_ice_server_entry(entry);
+        assert!(server.is_some());
+        let server = server.unwrap();
+        assert_eq!(server.urls, vec!["stun:stun.l.google.com:19302"]);
+        assert!(server.username.is_empty());
+        assert!(server.password.is_empty());
+    }
+
+    #[test]
+    fn test_parse_ice_server_entry_turn_with_credentials() {
+        let entry = r#"<turn:turn.example.com:3478>; rel="ice-server"; username="user"; credential="pass""#;
+        let server = parse_ice_server_entry(entry);
+        assert!(server.is_some());
+        let server = server.unwrap();
+        assert_eq!(server.urls, vec!["turn:turn.example.com:3478"]);
+        assert_eq!(server.username, "user");
+        assert_eq!(server.password, "pass");
+    }
+
+    #[test]
+    fn test_parse_ice_server_entry_not_ice_server() {
+        let entry = r#"<http://example.com>; rel="something-else""#;
+        let server = parse_ice_server_entry(entry);
+        assert!(server.is_none());
+    }
+
+    #[test]
+    fn test_parse_ice_server_entry_no_angle_brackets() {
+        let entry = r#"stun:stun.l.google.com:19302; rel="ice-server""#;
+        let server = parse_ice_server_entry(entry);
+        assert!(server.is_none());
+    }
+
+    // --- parse_ice_servers_from_headers ---
+
+    #[test]
+    fn test_parse_ice_servers_from_headers_empty() {
+        let headers = HeaderMap::new();
+        let servers = parse_ice_servers_from_headers(&headers);
+        assert!(servers.is_empty());
+    }
+}

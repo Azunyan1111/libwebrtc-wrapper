@@ -426,4 +426,214 @@ mod tests {
         let restored = f64::from_be_bytes(bytes.try_into().unwrap());
         assert_eq!(restored, 48000.0);
     }
+
+    // --- encode_vint_value boundary ---
+
+    #[test]
+    fn test_encode_vint_value_boundary() {
+        // 1バイト最大値: 127 (0x7F) -> 0xFF
+        assert_eq!(encode_vint_value(0x7F), vec![0xFF]);
+        // 2バイト最小値: 128 (0x80) -> 0x40, 0x80
+        assert_eq!(encode_vint_value(0x80), vec![0x40, 0x80]);
+        // 2バイト最大値: 0x3FFF -> 0x7F, 0xFF
+        assert_eq!(encode_vint_value(0x3FFF), vec![0x7F, 0xFF]);
+    }
+
+    // --- encode_vint_size ---
+
+    #[test]
+    fn test_encode_vint_size() {
+        // encode_vint_sizeはencode_vint_valueと等価
+        assert_eq!(encode_vint_size(1), encode_vint_value(1));
+        assert_eq!(encode_vint_size(0x80), encode_vint_value(0x80));
+        assert_eq!(encode_vint_size(0x3FFF), encode_vint_value(0x3FFF));
+    }
+
+    // --- write_ebml_element ---
+
+    #[test]
+    fn test_write_ebml_element() {
+        let mut buf = Vec::new();
+        let id = &[0x42, 0x86]; // EBML_VERSION
+        let data = &[0x01];
+        write_ebml_element(&mut buf, id, data).unwrap();
+        // ID(2) + Size VINT(1: 0x81) + Data(1)
+        assert_eq!(buf, vec![0x42, 0x86, 0x81, 0x01]);
+    }
+
+    // --- MkvWriter::new ---
+
+    #[test]
+    fn test_mkv_writer_new_writes_header() {
+        let buf = Vec::new();
+        let config = MkvConfig {
+            video_width: 1920,
+            video_height: 1080,
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+        };
+        let writer = MkvWriter::new(buf, config).unwrap();
+        let output = writer.writer;
+        // EBML header先頭4バイト: 0x1A 0x45 0xDF 0xA3
+        assert!(output.len() >= 4);
+        assert_eq!(&output[0..4], ebml_ids::EBML);
+        // header_writtenフラグ確認
+        assert!(writer.header_written);
+    }
+
+    // --- write_video_frame ---
+
+    #[test]
+    fn test_mkv_writer_write_video_frame() {
+        let buf = Vec::new();
+        let config = MkvConfig {
+            video_width: 2,
+            video_height: 2,
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+        };
+        let mut writer = MkvWriter::new(buf, config).unwrap();
+        let header_len = writer.writer.len();
+
+        let frame_data = vec![0u8; 6]; // 2x2 I420: Y=4 + U=1 + V=1
+        writer.write_video_frame(&frame_data, 0, true).unwrap();
+
+        // クラスタが開始され、データが書き込まれたことを確認
+        assert!(writer.writer.len() > header_len);
+        assert_eq!(writer.cluster_start_time, Some(0));
+    }
+
+    // --- write_audio_frame ---
+
+    #[test]
+    fn test_mkv_writer_write_audio_frame() {
+        let buf = Vec::new();
+        let config = MkvConfig {
+            video_width: 2,
+            video_height: 2,
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+        };
+        let mut writer = MkvWriter::new(buf, config).unwrap();
+        let header_len = writer.writer.len();
+
+        let audio_data = vec![0u8; 192]; // 48 samples * 2ch * 2bytes
+        writer.write_audio_frame(&audio_data, 0).unwrap();
+
+        assert!(writer.writer.len() > header_len);
+    }
+
+    // --- maybe_start_new_cluster ---
+
+    #[test]
+    fn test_mkv_writer_cluster_transition() {
+        let buf = Vec::new();
+        let config = MkvConfig {
+            video_width: 2,
+            video_height: 2,
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+        };
+        let mut writer = MkvWriter::new(buf, config).unwrap();
+
+        // 最初のフレームでクラスタ開始
+        writer.write_video_frame(&[0u8; 6], 0, true).unwrap();
+        assert_eq!(writer.cluster_start_time, Some(0));
+
+        // 5000ms未満: 同じクラスタ
+        writer.write_video_frame(&[0u8; 6], 4999, false).unwrap();
+        assert_eq!(writer.cluster_start_time, Some(0));
+
+        // 5000ms: CLUSTER_DURATION_MS閾値で新クラスタ
+        writer.write_video_frame(&[0u8; 6], 5000, false).unwrap();
+        assert_eq!(writer.cluster_start_time, Some(5000));
+    }
+
+    // --- relative_timestamp ---
+
+    #[test]
+    fn test_relative_timestamp_basic() {
+        let buf = Vec::new();
+        let config = MkvConfig {
+            video_width: 2,
+            video_height: 2,
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+        };
+        let mut writer = MkvWriter::new(buf, config).unwrap();
+        writer.cluster_start_time = Some(1000);
+
+        assert_eq!(writer.relative_timestamp(1000), 0);
+        assert_eq!(writer.relative_timestamp(1500), 500);
+        assert_eq!(writer.relative_timestamp(1033), 33);
+    }
+
+    #[test]
+    fn test_relative_timestamp_clamp() {
+        let buf = Vec::new();
+        let config = MkvConfig {
+            video_width: 2,
+            video_height: 2,
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+        };
+        let mut writer = MkvWriter::new(buf, config).unwrap();
+        writer.cluster_start_time = Some(0);
+
+        // i16::MAX = 32767
+        assert_eq!(writer.relative_timestamp(32767), 32767);
+        assert_eq!(writer.relative_timestamp(40000), 32767); // クランプ
+
+        // 負の相対値
+        writer.cluster_start_time = Some(50000);
+        assert_eq!(writer.relative_timestamp(0), -32768); // クランプ
+    }
+
+    // --- build_video_track ---
+
+    #[test]
+    fn test_build_video_track() {
+        let buf = Vec::new();
+        let config = MkvConfig {
+            video_width: 1920,
+            video_height: 1080,
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+        };
+        let writer = MkvWriter::new(buf, config).unwrap();
+        let track_data = writer.build_video_track().unwrap();
+
+        // V_UNCOMPRESSEDコーデックIDが含まれていること
+        let codec_id = b"V_UNCOMPRESSED";
+        assert!(
+            track_data
+                .windows(codec_id.len())
+                .any(|w| w == codec_id),
+            "V_UNCOMPRESSED codec ID not found in video track"
+        );
+    }
+
+    // --- build_audio_track ---
+
+    #[test]
+    fn test_build_audio_track() {
+        let buf = Vec::new();
+        let config = MkvConfig {
+            video_width: 1920,
+            video_height: 1080,
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+        };
+        let writer = MkvWriter::new(buf, config).unwrap();
+        let track_data = writer.build_audio_track().unwrap();
+
+        // A_PCM/INT/LITコーデックIDが含まれていること
+        let codec_id = b"A_PCM/INT/LIT";
+        assert!(
+            track_data
+                .windows(codec_id.len())
+                .any(|w| w == codec_id),
+            "A_PCM/INT/LIT codec ID not found in audio track"
+        );
+    }
 }
