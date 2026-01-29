@@ -295,6 +295,10 @@ impl WhepClient {
             }
         }
 
+        // Send remaining ICE candidates and end-of-candidates after connection established
+        self.process_ice_candidates().await;
+        self.check_and_send_end_of_candidates().await;
+
         info!("Connection established. Setting up streams...");
 
         // Set up NativeVideoStream and NativeAudioStream
@@ -337,12 +341,72 @@ impl WhepClient {
         let mut last_debug_log = Instant::now();
         let mut last_video_count = 0u64;
         let mut last_audio_count = 0u64;
+        // Track last video frame reception time for stall detection
+        let mut last_video_frame_time: Option<Instant> = None;
+        let video_stall_timeout = std::time::Duration::from_secs(5);
 
         loop {
             // Check if both streams have ended
             if video_stream.is_none() && audio_stream.is_none() {
                 info!("Both video and audio streams have ended");
                 break;
+            }
+
+            // Check video frame stall: exit if no video frame received for 5 seconds
+            if let Some(last_time) = last_video_frame_time {
+                if last_time.elapsed() > video_stall_timeout {
+                    eprintln!(
+                        "[WARN] Video frames stalled for over {}s, exiting",
+                        video_stall_timeout.as_secs()
+                    );
+                    break;
+                }
+            }
+
+            // Periodic checks (every 5 seconds)
+            if last_debug_log.elapsed() >= std::time::Duration::from_secs(5) {
+                // Check ICE connection state
+                if let Some(ref pc) = self.peer_connection {
+                    let state = pc.ice_connection_state();
+                    if matches!(
+                        state,
+                        IceConnectionState::Failed | IceConnectionState::Closed
+                    ) {
+                        warn!("Connection lost (state={:?})", state);
+                        break;
+                    }
+                }
+
+                // Log frame statistics in debug mode
+                if self.debug {
+                    let video_count = ctx.video_frame_count.load(Ordering::Relaxed);
+                    let audio_count = ctx.audio_frame_count.load(Ordering::Relaxed);
+                    let last_video_ts = ctx.last_video_timestamp_ms.load(Ordering::Relaxed);
+                    let last_audio_ts = ctx.last_audio_timestamp_ms.load(Ordering::Relaxed);
+                    let av_diff = if last_video_ts >= 0 && last_audio_ts >= 0 {
+                        last_video_ts - last_audio_ts
+                    } else {
+                        -1
+                    };
+                    let video_delta = video_count.saturating_sub(last_video_count);
+                    let audio_delta = audio_count.saturating_sub(last_audio_count);
+
+                    eprintln!(
+                        "[DEBUG] Frame stats: video={} (+{}), audio={} (+{}), last_video_ts={}ms, last_audio_ts={}ms, av_diff={}ms",
+                        video_count,
+                        video_delta,
+                        audio_count,
+                        audio_delta,
+                        last_video_ts,
+                        last_audio_ts,
+                        av_diff
+                    );
+
+                    last_video_count = video_count;
+                    last_audio_count = audio_count;
+                }
+
+                last_debug_log = Instant::now();
             }
 
             // Use tokio::select! to process video and audio frames concurrently
@@ -358,6 +422,7 @@ impl WhepClient {
                     match video_frame {
                         Some(frame) => {
                             self.handle_video_frame(&ctx, frame);
+                            last_video_frame_time = Some(Instant::now());
                         }
                         None => {
                             // Stream ended - set to None to prevent CPU spin
@@ -387,63 +452,6 @@ impl WhepClient {
                     }
                 }
 
-                // Process ICE candidates periodically
-                _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
-                    self.process_ice_candidates().await;
-                    self.check_and_send_end_of_candidates().await;
-
-                    // Check connection state
-                    if let Some(ref pc) = self.peer_connection {
-                        let state = pc.ice_connection_state();
-                        if matches!(
-                            state,
-                            IceConnectionState::Failed | IceConnectionState::Closed
-                        ) {
-                            warn!("Connection lost (state={:?})", state);
-                            break;
-                        }
-                    }
-
-                    // Log frame statistics in debug mode
-                    if self.debug
-                        && last_debug_log.elapsed() >= std::time::Duration::from_secs(5)
-                    {
-                        let video_count = ctx.video_frame_count.load(Ordering::Relaxed);
-                        let audio_count = ctx.audio_frame_count.load(Ordering::Relaxed);
-                        let last_video_ts = ctx.last_video_timestamp_ms.load(Ordering::Relaxed);
-                        let last_audio_ts = ctx.last_audio_timestamp_ms.load(Ordering::Relaxed);
-                        let av_diff = if last_video_ts >= 0 && last_audio_ts >= 0 {
-                            last_video_ts - last_audio_ts
-                        } else {
-                            -1
-                        };
-                        let video_delta = video_count.saturating_sub(last_video_count);
-                        let audio_delta = audio_count.saturating_sub(last_audio_count);
-
-                        eprintln!(
-                            "[DEBUG] Frame stats: video={} (+{}), audio={} (+{}), last_video_ts={}ms, last_audio_ts={}ms, av_diff={}ms",
-                            video_count,
-                            video_delta,
-                            audio_count,
-                            audio_delta,
-                            last_video_ts,
-                            last_audio_ts,
-                            av_diff
-                        );
-
-                        if video_delta == 0 && audio_delta == 0 {
-                            eprintln!("[WARN] No audio/video frames in last 5s");
-                        } else if video_delta == 0 {
-                            eprintln!("[WARN] Video frames stalled for 5s");
-                        } else if audio_delta == 0 {
-                            eprintln!("[WARN] Audio frames stalled for 5s");
-                        }
-
-                        last_video_count = video_count;
-                        last_audio_count = audio_count;
-                        last_debug_log = Instant::now();
-                    }
-                }
             }
         }
 
