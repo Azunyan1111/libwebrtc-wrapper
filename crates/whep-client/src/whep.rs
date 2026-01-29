@@ -352,17 +352,6 @@ impl WhepClient {
                 break;
             }
 
-            // Check video frame stall: exit if no video frame received for 5 seconds
-            if let Some(last_time) = last_video_frame_time {
-                if last_time.elapsed() > video_stall_timeout {
-                    eprintln!(
-                        "[WARN] Video frames stalled for over {}s, exiting",
-                        video_stall_timeout.as_secs()
-                    );
-                    break;
-                }
-            }
-
             // Periodic checks (every 5 seconds)
             if last_debug_log.elapsed() >= std::time::Duration::from_secs(5) {
                 // Check ICE connection state
@@ -421,7 +410,10 @@ impl WhepClient {
                 } => {
                     match video_frame {
                         Some(frame) => {
-                            self.handle_video_frame(&ctx, frame);
+                            if let Err(e) = self.handle_video_frame(&ctx, frame) {
+                                warn!("Video frame write error, stopping: {}", e);
+                                break;
+                            }
                             last_video_frame_time = Some(Instant::now());
                         }
                         None => {
@@ -442,7 +434,10 @@ impl WhepClient {
                 } => {
                     match audio_frame {
                         Some(frame) => {
-                            self.handle_audio_frame(&ctx, frame);
+                            if let Err(e) = self.handle_audio_frame(&ctx, frame) {
+                                warn!("Audio frame write error, stopping: {}", e);
+                                break;
+                            }
                         }
                         None => {
                             // Stream ended - set to None to prevent CPU spin
@@ -450,6 +445,27 @@ impl WhepClient {
                             audio_stream = None;
                         }
                     }
+                }
+
+                // Video stall detection: break if no video frame for video_stall_timeout
+                _ = async {
+                    if let Some(last_time) = last_video_frame_time {
+                        let elapsed = last_time.elapsed();
+                        if elapsed >= video_stall_timeout {
+                            // Already stalled, resolve immediately
+                            return;
+                        }
+                        tokio::time::sleep(video_stall_timeout - elapsed).await;
+                    } else {
+                        // No video frame received yet, don't trigger stall timeout
+                        futures::future::pending::<()>().await;
+                    }
+                } => {
+                    eprintln!(
+                        "[WARN] Video frames stalled for over {}s, exiting",
+                        video_stall_timeout.as_secs()
+                    );
+                    break;
                 }
 
             }
@@ -463,7 +479,7 @@ impl WhepClient {
     }
 
     /// Handle a video frame
-    fn handle_video_frame(&self, ctx: &Arc<CallbackContext>, frame: BoxVideoFrame) {
+    fn handle_video_frame(&self, ctx: &Arc<CallbackContext>, frame: BoxVideoFrame) -> Result<()> {
         let count = ctx.video_frame_count.fetch_add(1, Ordering::Relaxed) + 1;
         let timestamp_us = frame.timestamp_us;
 
@@ -562,6 +578,7 @@ impl WhepClient {
             if let Some(ref mut writer) = *guard {
                 if let Err(e) = writer.write_video_frame(&frame_data, timestamp_ms, true) {
                     eprintln!("[ERROR] Failed to write video frame: {}", e);
+                    return Err(anyhow!("Failed to write video frame: {}", e));
                 }
             }
         }
@@ -573,13 +590,15 @@ impl WhepClient {
                 count, width, height, timestamp_ms
             );
         }
+
+        Ok(())
     }
 
     /// Handle an audio frame
-    fn handle_audio_frame(&self, ctx: &Arc<CallbackContext>, frame: AudioFrame<'static>) {
+    fn handle_audio_frame(&self, ctx: &Arc<CallbackContext>, frame: AudioFrame<'static>) -> Result<()> {
         // Check if MKV writer is initialized (waits for first video frame)
         if !ctx.mkv_writer_initialized.load(Ordering::Relaxed) {
-            return;
+            return Ok(());
         }
 
         let sample_rate = frame.sample_rate as u32;
@@ -617,6 +636,7 @@ impl WhepClient {
             if let Some(ref mut writer) = *guard {
                 if let Err(e) = writer.write_audio_frame(byte_data, timestamp_ms) {
                     eprintln!("[ERROR] Failed to write audio frame: {}", e);
+                    return Err(anyhow!("Failed to write audio frame: {}", e));
                 }
             }
         }
@@ -628,6 +648,8 @@ impl WhepClient {
                 count, sample_rate, nb_channels, nb_frames, timestamp_ms
             );
         }
+
+        Ok(())
     }
 
     /// Process pending ICE candidates and send them via PATCH (trickle ICE)

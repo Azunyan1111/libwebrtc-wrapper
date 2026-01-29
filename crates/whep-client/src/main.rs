@@ -116,7 +116,9 @@ async fn main() -> Result<()> {
 
     eprintln!("[INFO] Connected. Receiving frames (Press Ctrl+C to stop)...");
 
-    // Run with Ctrl+C handling
+    // Run with Ctrl+C and SIGTERM handling
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         result = async { client.run().await } => {
             if let Err(e) = result {
@@ -125,6 +127,9 @@ async fn main() -> Result<()> {
         }
         _ = tokio::signal::ctrl_c() => {
             eprintln!("[INFO] Received Ctrl+C, shutting down...");
+        }
+        _ = sigterm.recv() => {
+            eprintln!("[INFO] Received SIGTERM, shutting down...");
         }
     }
 
