@@ -256,11 +256,46 @@ impl<W: Write> MkvWriter<W> {
     }
 
     /// Write a video frame
+    #[allow(dead_code)]
     pub fn write_video_frame(&mut self, frame: &[u8], timestamp_ms: i64, is_keyframe: bool) -> Result<()> {
         self.maybe_start_new_cluster(timestamp_ms, is_keyframe)?;
 
         let relative_ts = self.relative_timestamp(timestamp_ms);
         self.write_simple_block(VIDEO_TRACK_NUMBER, relative_ts, is_keyframe, frame)?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Write a video frame from I420 planes without repacking into a contiguous buffer
+    pub fn write_video_frame_i420(
+        &mut self,
+        width: u32,
+        height: u32,
+        y_stride: u32,
+        u_stride: u32,
+        v_stride: u32,
+        y_data: &[u8],
+        u_data: &[u8],
+        v_data: &[u8],
+        timestamp_ms: i64,
+        is_keyframe: bool,
+    ) -> Result<()> {
+        self.maybe_start_new_cluster(timestamp_ms, is_keyframe)?;
+
+        let relative_ts = self.relative_timestamp(timestamp_ms);
+        self.write_simple_block_i420(
+            VIDEO_TRACK_NUMBER,
+            relative_ts,
+            is_keyframe,
+            width,
+            height,
+            y_stride,
+            u_stride,
+            v_stride,
+            y_data,
+            u_data,
+            v_data,
+        )?;
         self.writer.flush()?;
         Ok(())
     }
@@ -290,17 +325,97 @@ impl<W: Write> MkvWriter<W> {
         // SimpleBlock structure:
         // [Track Number (VINT)] [Relative Timestamp (int16 BE)] [Flags] [Data]
         let track_vint = encode_vint_value(track_number as u64);
-        let ts_bytes = relative_ts.to_be_bytes();
         let flags: u8 = if is_keyframe { 0x80 } else { 0x00 };
 
-        let block_size = track_vint.len() + 2 + 1 + data.len();
-        let mut block_data = Vec::with_capacity(block_size);
-        block_data.extend_from_slice(&track_vint);
-        block_data.extend_from_slice(&ts_bytes);
-        block_data.push(flags);
-        block_data.extend_from_slice(data);
+        let header_len = track_vint.len() + 2 + 1;
+        let block_size = header_len + data.len();
 
-        write_ebml_element(&mut self.writer, ebml_ids::SIMPLE_BLOCK, &block_data)?;
+        self.writer.write_all(ebml_ids::SIMPLE_BLOCK)?;
+        let size = encode_vint_size(block_size as u64);
+        self.writer.write_all(&size)?;
+        self.writer.write_all(&track_vint)?;
+        self.writer.write_all(&relative_ts.to_be_bytes())?;
+        self.writer.write_all(&[flags])?;
+        self.writer.write_all(data)?;
+        Ok(())
+    }
+
+    /// Write a SimpleBlock with I420 planes without repacking
+    fn write_simple_block_i420(
+        &mut self,
+        track_number: u8,
+        relative_ts: i16,
+        is_keyframe: bool,
+        width: u32,
+        height: u32,
+        y_stride: u32,
+        u_stride: u32,
+        v_stride: u32,
+        y_data: &[u8],
+        u_data: &[u8],
+        v_data: &[u8],
+    ) -> Result<()> {
+        let w = width as usize;
+        let h = height as usize;
+        let y_stride = y_stride as usize;
+        let u_stride = u_stride as usize;
+        let v_stride = v_stride as usize;
+
+        let uv_w = (w + 1) / 2;
+        let uv_h = (h + 1) / 2;
+
+        let y_required = required_plane_size(y_stride, w, h)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Y plane size overflow"))?;
+        let u_required = required_plane_size(u_stride, uv_w, uv_h)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "U plane size overflow"))?;
+        let v_required = required_plane_size(v_stride, uv_w, uv_h)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "V plane size overflow"))?;
+
+        if y_required > y_data.len() || u_required > u_data.len() || v_required > v_data.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "I420 plane data is smaller than expected",
+            ));
+        }
+
+        let data_len = w
+            .checked_mul(h)
+            .and_then(|y| uv_w.checked_mul(uv_h).and_then(|uv| y.checked_add(uv.checked_mul(2)?)))
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "I420 data length overflow"))?;
+
+        let track_vint = encode_vint_value(track_number as u64);
+        let header_len = track_vint.len() + 2 + 1;
+        let block_size = header_len + data_len;
+
+        self.writer.write_all(ebml_ids::SIMPLE_BLOCK)?;
+        let size = encode_vint_size(block_size as u64);
+        self.writer.write_all(&size)?;
+        self.writer.write_all(&track_vint)?;
+        self.writer.write_all(&relative_ts.to_be_bytes())?;
+        let flags: u8 = if is_keyframe { 0x80 } else { 0x00 };
+        self.writer.write_all(&[flags])?;
+
+        // Write Y plane
+        for row in 0..h {
+            let start = row * y_stride;
+            let end = start + w;
+            self.writer.write_all(&y_data[start..end])?;
+        }
+
+        // Write U plane
+        for row in 0..uv_h {
+            let start = row * u_stride;
+            let end = start + uv_w;
+            self.writer.write_all(&u_data[start..end])?;
+        }
+
+        // Write V plane
+        for row in 0..uv_h {
+            let start = row * v_stride;
+            let end = start + uv_w;
+            self.writer.write_all(&v_data[start..end])?;
+        }
+
         Ok(())
     }
 
@@ -393,6 +508,14 @@ fn write_ebml_element<W: Write>(writer: &mut W, id: &[u8], data: &[u8]) -> Resul
     writer.write_all(&size)?;
     writer.write_all(data)?;
     Ok(())
+}
+
+fn required_plane_size(stride: usize, row_width: usize, rows: usize) -> Option<usize> {
+    if rows == 0 {
+        return Some(0);
+    }
+    let last_row = rows.checked_sub(1)?;
+    last_row.checked_mul(stride)?.checked_add(row_width)
 }
 
 #[cfg(test)]

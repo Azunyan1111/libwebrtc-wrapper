@@ -364,17 +364,27 @@ impl WhipClient {
 
             // Read next frame from MKV
             match reader.read_frame()? {
-                Some(MkvFrame::Video {
-                    data,
-                    timestamp_ms,
-                    is_keyframe,
-                }) => {
-                    self.feed_video_frame(&ctx, &video_source, &data, timestamp_ms, is_keyframe);
-                }
-                Some(MkvFrame::Audio { data, timestamp_ms }) => {
-                    self.feed_audio_frame(&ctx, &audio_source, &data, timestamp_ms)
-                        .await?;
-                }
+                Some(frame) => match frame {
+                    MkvFrame::Video {
+                        timestamp_ms,
+                        is_keyframe,
+                        ..
+                    } => {
+                        let payload = frame.payload();
+                        self.feed_video_frame(
+                            &ctx,
+                            &video_source,
+                            payload,
+                            timestamp_ms,
+                            is_keyframe,
+                        );
+                    }
+                    MkvFrame::Audio { timestamp_ms, .. } => {
+                        let payload = frame.payload();
+                        self.feed_audio_frame(&ctx, &audio_source, payload, timestamp_ms)
+                            .await?;
+                    }
+                },
                 None => {
                     // EOF reached
                     info!("End of MKV stream");
@@ -452,7 +462,9 @@ impl WhipClient {
 
         // Copy I420 data to buffer
         let y_size = (width * height) as usize;
-        let uv_size = y_size / 4;
+        let uv_w = (width + 1) / 2;
+        let uv_h = (height + 1) / 2;
+        let uv_size = (uv_w * uv_h) as usize;
 
         if data.len() >= y_size + uv_size * 2 {
             let (y_data, u_data, v_data) = i420.data_mut();

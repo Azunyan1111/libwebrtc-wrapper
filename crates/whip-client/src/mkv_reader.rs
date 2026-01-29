@@ -24,13 +24,24 @@ pub struct MkvTrackInfo {
 pub enum MkvFrame {
     Video {
         data: Vec<u8>,
+        data_offset: usize,
         timestamp_ms: i64,
         is_keyframe: bool,
     },
     Audio {
         data: Vec<u8>,
+        data_offset: usize,
         timestamp_ms: i64,
     },
+}
+
+impl MkvFrame {
+    pub fn payload(&self) -> &[u8] {
+        match self {
+            MkvFrame::Video { data, data_offset, .. } => &data[*data_offset..],
+            MkvFrame::Audio { data, data_offset, .. } => &data[*data_offset..],
+        }
+    }
 }
 
 /// MKVストリームリーダー
@@ -187,7 +198,7 @@ impl<R: Read> MkvReader<R> {
                         (ts as i64 * self.track_info.timecode_scale as i64) / 1_000_000;
                 }
                 MatroskaSpec::SimpleBlock(block_data) => {
-                    return self.parse_simple_block(&block_data);
+                    return self.parse_simple_block(block_data);
                 }
                 _ => {}
             }
@@ -197,13 +208,13 @@ impl<R: Read> MkvReader<R> {
     }
 
     /// SimpleBlockをパースしてMkvFrameを返す
-    fn parse_simple_block(&self, data: &[u8]) -> Result<Option<MkvFrame>> {
+    fn parse_simple_block(&self, data: Vec<u8>) -> Result<Option<MkvFrame>> {
         if data.len() < 4 {
             return Err(anyhow!("SimpleBlock too short: {} bytes", data.len()));
         }
 
         // Parse track number (VINT encoded)
-        let (track_num, vint_size) = parse_vint(data)?;
+        let (track_num, vint_size) = parse_vint(&data)?;
 
         // Relative timestamp (2 bytes, signed big-endian)
         let relative_ts = i16::from_be_bytes([data[vint_size], data[vint_size + 1]]) as i64;
@@ -212,8 +223,11 @@ impl<R: Read> MkvReader<R> {
         let flags = data[vint_size + 2];
         let is_keyframe = (flags & 0x80) != 0;
 
-        // Frame data
-        let frame_data = data[vint_size + 3..].to_vec();
+        // Frame data offset (payload starts after track + timestamp + flags)
+        let data_offset = vint_size + 3;
+        if data_offset > data.len() {
+            return Err(anyhow!("SimpleBlock header exceeds data length"));
+        }
 
         // Calculate absolute timestamp
         let timestamp_ms = self.current_cluster_timestamp + relative_ts;
@@ -221,13 +235,15 @@ impl<R: Read> MkvReader<R> {
         // Determine if this is video or audio
         if Some(track_num) == self.video_track_num {
             return Ok(Some(MkvFrame::Video {
-                data: frame_data,
+                data,
+                data_offset,
                 timestamp_ms,
                 is_keyframe,
             }));
         } else if Some(track_num) == self.audio_track_num {
             return Ok(Some(MkvFrame::Audio {
-                data: frame_data,
+                data,
+                data_offset,
                 timestamp_ms,
             }));
         }
@@ -327,17 +343,19 @@ mod tests {
     fn test_mkv_frame_video() {
         let frame = MkvFrame::Video {
             data: vec![0x01, 0x02, 0x03],
+            data_offset: 0,
             timestamp_ms: 1000,
             is_keyframe: true,
         };
 
         if let MkvFrame::Video {
             data,
+            data_offset,
             timestamp_ms,
             is_keyframe,
         } = frame
         {
-            assert_eq!(data, vec![0x01, 0x02, 0x03]);
+            assert_eq!(&data[data_offset..], vec![0x01, 0x02, 0x03]);
             assert_eq!(timestamp_ms, 1000);
             assert!(is_keyframe);
         } else {
@@ -349,11 +367,17 @@ mod tests {
     fn test_mkv_frame_audio() {
         let frame = MkvFrame::Audio {
             data: vec![0x04, 0x05, 0x06],
+            data_offset: 0,
             timestamp_ms: 2000,
         };
 
-        if let MkvFrame::Audio { data, timestamp_ms } = frame {
-            assert_eq!(data, vec![0x04, 0x05, 0x06]);
+        if let MkvFrame::Audio {
+            data,
+            data_offset,
+            timestamp_ms,
+        } = frame
+        {
+            assert_eq!(&data[data_offset..], vec![0x04, 0x05, 0x06]);
             assert_eq!(timestamp_ms, 2000);
         } else {
             panic!("Expected Audio frame");

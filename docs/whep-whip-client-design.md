@@ -1485,9 +1485,9 @@ MKVでrawvideoを格納する際の仕様:
 
 I420フォーマット:
 - Y平面: width x height bytes
-- U平面: (width/2) x (height/2) bytes
-- V平面: (width/2) x (height/2) bytes
-- 合計: width x height x 1.5 bytes per frame
+- U平面: ((width + 1) / 2) x ((height + 1) / 2) bytes
+- V平面: ((width + 1) / 2) x ((height + 1) / 2) bytes
+- 合計: width x height + 2 * ((width + 1) / 2) * ((height + 1) / 2) bytes per frame
 
 **帯域幅計算例（1080p30fps）:**
 - 1920 x 1080 x 1.5 = 3,110,400 bytes/frame

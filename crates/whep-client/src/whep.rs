@@ -524,59 +524,28 @@ impl WhepClient {
         // Get Y, U, V data slices
         let (y_data, u_data, v_data) = i420.data();
 
-        // Build I420 frame data (packed, no stride padding)
-        let w = width as usize;
-        let h = height as usize;
-        let y_stride_usize = y_stride as usize;
-        let u_stride_usize = u_stride as usize;
-        let v_stride_usize = v_stride as usize;
-
-        let y_size = w * h;
-        let uv_w = w / 2;
-        let uv_h = h / 2;
-        let uv_size = uv_w * uv_h;
-        let frame_size = y_size + uv_size * 2;
-
-        let mut frame_data = Vec::with_capacity(frame_size);
-
-        // Copy Y plane (row by row to handle stride)
-        for row in 0..h {
-            let row_start = row * y_stride_usize;
-            let row_end = row_start + w;
-            if row_end <= y_data.len() {
-                frame_data.extend_from_slice(&y_data[row_start..row_end]);
-            }
-        }
-
-        // Copy U plane (half width, half height)
-        for row in 0..uv_h {
-            let row_start = row * u_stride_usize;
-            let row_end = row_start + uv_w;
-            if row_end <= u_data.len() {
-                frame_data.extend_from_slice(&u_data[row_start..row_end]);
-            }
-        }
-
-        // Copy V plane (half width, half height)
-        for row in 0..uv_h {
-            let row_start = row * v_stride_usize;
-            let row_end = row_start + uv_w;
-            if row_end <= v_data.len() {
-                frame_data.extend_from_slice(&v_data[row_start..row_end]);
-            }
-        }
-
         // Calculate timestamp relative to first frame
         let first_ts = ctx.first_video_timestamp_us.load(Ordering::Relaxed);
         let timestamp_ms = (timestamp_us - first_ts) / 1000;
         ctx.last_video_timestamp_ms
             .store(timestamp_ms, Ordering::Relaxed);
 
-        // Write to MKV
+        // Write to MKV without repacking into a contiguous buffer
         {
             let mut guard = ctx.mkv_writer.lock();
             if let Some(ref mut writer) = *guard {
-                if let Err(e) = writer.write_video_frame(&frame_data, timestamp_ms, true) {
+                if let Err(e) = writer.write_video_frame_i420(
+                    width,
+                    height,
+                    y_stride,
+                    u_stride,
+                    v_stride,
+                    y_data,
+                    u_data,
+                    v_data,
+                    timestamp_ms,
+                    true,
+                ) {
                     eprintln!("[ERROR] Failed to write video frame: {}", e);
                     return Err(anyhow!("Failed to write video frame: {}", e));
                 }
