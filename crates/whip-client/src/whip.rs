@@ -327,6 +327,10 @@ impl WhipClient {
     }
 
     /// Send frames from MKV reader to WebRTC
+    ///
+    /// ビデオとオーディオを別タスクで並列処理する。
+    /// メインループはMKV読取+チャネルディスパッチ+ICE処理のみ行い、
+    /// ビデオのペーシングsleepがオーディオをブロックしないようにする。
     async fn send_frames<R: Read>(&mut self, reader: &mut MkvReader<R>) -> Result<()> {
         let ctx = self
             .callback_context
@@ -345,11 +349,68 @@ impl WhipClient {
             .clone()
             .ok_or_else(|| anyhow!("AudioSource not initialized"))?;
 
+        let video_width = self.video_width;
+        let video_height = self.video_height;
+        let debug = self.debug;
+
+        // unbounded channel: stdinからのMKV読取は自然にペーシングされるため安全
+        let (video_tx, mut video_rx) = mpsc::unbounded_channel::<MkvFrame>();
+        let (audio_tx, mut audio_rx) = mpsc::unbounded_channel::<MkvFrame>();
+
+        // ビデオタスク: ペーシング + フレーム投入
+        let video_ctx = ctx.clone();
+        let video_task = tokio::spawn(async move {
+            let mut pacing_base: Option<(Instant, i64)> = None;
+            while let Some(frame) = video_rx.recv().await {
+                if let MkvFrame::Video {
+                    timestamp_ms,
+                    is_keyframe,
+                    ..
+                } = &frame
+                {
+                    let (wall_start, first_ts) = pacing_base.get_or_insert_with(|| {
+                        (Instant::now(), *timestamp_ms)
+                    });
+                    let elapsed_ms = wall_start.elapsed().as_millis() as i64;
+                    let target_ms = *timestamp_ms - *first_ts;
+                    let wait_ms = target_ms - elapsed_ms;
+                    if wait_ms > 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms as u64)).await;
+                    }
+
+                    let payload = frame.payload();
+                    feed_video_frame(
+                        &video_ctx,
+                        &video_source,
+                        payload,
+                        *timestamp_ms,
+                        *is_keyframe,
+                        video_width,
+                        video_height,
+                    );
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        // オーディオタスク: フレーム投入（NativeAudioSourceのバックプレッシャーで自然にペーシング）
+        let audio_ctx = ctx.clone();
+        let audio_task = tokio::spawn(async move {
+            while let Some(frame) = audio_rx.recv().await {
+                if let MkvFrame::Audio { timestamp_ms, .. } = &frame {
+                    let payload = frame.payload();
+                    feed_audio_frame(&audio_ctx, &audio_source, payload, *timestamp_ms).await?;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+
+        // メインループ: MKV読取 + チャネルディスパッチ + ICE処理 + デバッグログ
         let mut last_debug_log = Instant::now();
         let mut last_video_count = 0u64;
         let mut last_audio_count = 0u64;
 
-        loop {
+        let dispatch_result: Result<()> = loop {
             // Check connection state
             if let Some(ref pc) = self.peer_connection {
                 let state = pc.ice_connection_state();
@@ -358,37 +419,33 @@ impl WhipClient {
                     IceConnectionState::Failed | IceConnectionState::Closed
                 ) {
                     warn!("Connection lost (state={:?})", state);
-                    break;
+                    break Ok(());
                 }
             }
 
             // Read next frame from MKV
-            match reader.read_frame()? {
-                Some(frame) => match frame {
-                    MkvFrame::Video {
-                        timestamp_ms,
-                        is_keyframe,
-                        ..
-                    } => {
-                        let payload = frame.payload();
-                        self.feed_video_frame(
-                            &ctx,
-                            &video_source,
-                            payload,
-                            timestamp_ms,
-                            is_keyframe,
-                        );
+            match reader.read_frame() {
+                Ok(Some(frame)) => {
+                    match &frame {
+                        MkvFrame::Video { .. } => {
+                            if video_tx.send(frame).is_err() {
+                                break Err(anyhow!("Video task terminated unexpectedly"));
+                            }
+                        }
+                        MkvFrame::Audio { .. } => {
+                            if audio_tx.send(frame).is_err() {
+                                break Err(anyhow!("Audio task terminated unexpectedly"));
+                            }
+                        }
                     }
-                    MkvFrame::Audio { timestamp_ms, .. } => {
-                        let payload = frame.payload();
-                        self.feed_audio_frame(&ctx, &audio_source, payload, timestamp_ms)
-                            .await?;
-                    }
-                },
-                None => {
+                }
+                Ok(None) => {
                     // EOF reached
                     info!("End of MKV stream");
-                    break;
+                    break Ok(());
+                }
+                Err(e) => {
+                    break Err(e);
                 }
             }
 
@@ -396,8 +453,11 @@ impl WhipClient {
             self.process_ice_candidates().await;
             self.check_and_send_end_of_candidates().await;
 
+            // yield to allow video/audio tasks to progress
+            tokio::task::yield_now().await;
+
             // Log frame statistics in debug mode
-            if self.debug && last_debug_log.elapsed() >= std::time::Duration::from_secs(5) {
+            if debug && last_debug_log.elapsed() >= std::time::Duration::from_secs(5) {
                 let video_count = ctx.video_frame_count.load(Ordering::Relaxed);
                 let audio_count = ctx.audio_frame_count.load(Ordering::Relaxed);
                 let last_video_ts = ctx.last_video_timestamp_ms.load(Ordering::Relaxed);
@@ -425,133 +485,16 @@ impl WhipClient {
                 last_audio_count = audio_count;
                 last_debug_log = Instant::now();
             }
-        }
-
-        Ok(())
-    }
-
-    /// Feed a video frame to the video source
-    fn feed_video_frame(
-        &self,
-        ctx: &Arc<CallbackContext>,
-        source: &NativeVideoSource,
-        data: &[u8],
-        timestamp_ms: i64,
-        is_keyframe: bool,
-    ) {
-        let count = ctx.video_frame_count.fetch_add(1, Ordering::Relaxed) + 1;
-
-        // Store first timestamp for reference
-        if count == 1 {
-            ctx.first_video_timestamp_ms
-                .store(timestamp_ms, Ordering::Relaxed);
-            eprintln!(
-                "[INFO] First video frame: {}x{} ts={}ms keyframe={}",
-                self.video_width, self.video_height, timestamp_ms, is_keyframe
-            );
-        }
-
-        ctx.last_video_timestamp_ms
-            .store(timestamp_ms, Ordering::Relaxed);
-
-        // Create I420 buffer and copy data
-        let width = self.video_width;
-        let height = self.video_height;
-
-        let mut i420 = I420Buffer::new(width, height);
-
-        // Copy I420 data to buffer
-        let y_size = (width * height) as usize;
-        let uv_w = (width + 1) / 2;
-        let uv_h = (height + 1) / 2;
-        let uv_size = (uv_w * uv_h) as usize;
-
-        if data.len() >= y_size + uv_size * 2 {
-            let (y_data, u_data, v_data) = i420.data_mut();
-
-            // Copy Y plane
-            let y_copy_len = y_data.len().min(y_size);
-            y_data[..y_copy_len].copy_from_slice(&data[..y_copy_len]);
-
-            // Copy U plane
-            let u_copy_len = u_data.len().min(uv_size);
-            u_data[..u_copy_len].copy_from_slice(&data[y_size..y_size + u_copy_len]);
-
-            // Copy V plane
-            let v_copy_len = v_data.len().min(uv_size);
-            v_data[..v_copy_len].copy_from_slice(&data[y_size + uv_size..y_size + uv_size + v_copy_len]);
-        }
-
-        // Calculate timestamp in microseconds relative to first frame
-        let first_ts = ctx.first_video_timestamp_ms.load(Ordering::Relaxed);
-        let relative_ts_ms = timestamp_ms - first_ts;
-        let timestamp_us = relative_ts_ms * 1000;
-
-        // Create and capture frame
-        let frame = VideoFrame {
-            rotation: VideoRotation::VideoRotation0,
-            timestamp_us,
-            buffer: i420,
-        };
-        source.capture_frame(&frame);
-
-        // Log every 30 frames
-        if count % 30 == 1 {
-            eprintln!(
-                "[TRACE] Video frame #{}: {}x{} ts={}ms keyframe={}",
-                count, width, height, timestamp_ms, is_keyframe
-            );
-        }
-    }
-
-    /// Feed an audio frame to the audio source
-    async fn feed_audio_frame(
-        &self,
-        ctx: &Arc<CallbackContext>,
-        source: &NativeAudioSource,
-        data: &[u8],
-        timestamp_ms: i64,
-    ) -> Result<()> {
-        let count = ctx.audio_frame_count.fetch_add(1, Ordering::Relaxed) + 1;
-
-        ctx.last_audio_timestamp_ms
-            .store(timestamp_ms, Ordering::Relaxed);
-
-        // Convert PCM S16LE bytes to i16 samples
-        let samples: Vec<i16> = data
-            .chunks_exact(2)
-            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect();
-
-        let sample_rate = source.sample_rate();
-        let num_channels = source.num_channels();
-        let samples_per_channel = (samples.len() / num_channels as usize) as u32;
-
-        // Track total samples for statistics
-        ctx.audio_total_samples
-            .fetch_add(samples_per_channel as u64, Ordering::Relaxed);
-
-        // Create and capture audio frame
-        let frame = AudioFrame {
-            data: Cow::Owned(samples),
-            sample_rate,
-            num_channels,
-            samples_per_channel,
         };
 
-        source
-            .capture_frame(&frame)
-            .await
-            .map_err(|e| anyhow!("Failed to capture audio frame: {}", e.message))?;
-
-        // Log every 100 frames
-        if count % 100 == 1 {
-            eprintln!(
-                "[TRACE] Audio frame #{}: {}Hz {}ch {} samples ts={}ms",
-                count, sample_rate, num_channels, samples_per_channel, timestamp_ms
-            );
-        }
-
+        // シャットダウン: チャネルdropでタスクにEOF通知
+        drop(video_tx);
+        drop(audio_tx);
+        let video_result = video_task.await.map_err(|e| anyhow!("Video task panicked: {}", e))?;
+        let audio_result = audio_task.await.map_err(|e| anyhow!("Audio task panicked: {}", e))?;
+        dispatch_result?;
+        video_result?;
+        audio_result?;
         Ok(())
     }
 
@@ -914,6 +857,131 @@ fn parse_param_value(value: &str) -> Option<String> {
     } else {
         Some(unquoted)
     }
+}
+
+/// Feed a video frame to the video source
+fn feed_video_frame(
+    ctx: &Arc<CallbackContext>,
+    source: &NativeVideoSource,
+    data: &[u8],
+    timestamp_ms: i64,
+    is_keyframe: bool,
+    video_width: u32,
+    video_height: u32,
+) {
+    let count = ctx.video_frame_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+    // Store first timestamp for reference
+    if count == 1 {
+        ctx.first_video_timestamp_ms
+            .store(timestamp_ms, Ordering::Relaxed);
+        eprintln!(
+            "[INFO] First video frame: {}x{} ts={}ms keyframe={}",
+            video_width, video_height, timestamp_ms, is_keyframe
+        );
+    }
+
+    ctx.last_video_timestamp_ms
+        .store(timestamp_ms, Ordering::Relaxed);
+
+    // Create I420 buffer and copy data
+    let width = video_width;
+    let height = video_height;
+
+    let mut i420 = I420Buffer::new(width, height);
+
+    // Copy I420 data to buffer
+    let y_size = (width * height) as usize;
+    let uv_w = (width + 1) / 2;
+    let uv_h = (height + 1) / 2;
+    let uv_size = (uv_w * uv_h) as usize;
+
+    if data.len() >= y_size + uv_size * 2 {
+        let (y_data, u_data, v_data) = i420.data_mut();
+
+        // Copy Y plane
+        let y_copy_len = y_data.len().min(y_size);
+        y_data[..y_copy_len].copy_from_slice(&data[..y_copy_len]);
+
+        // Copy U plane
+        let u_copy_len = u_data.len().min(uv_size);
+        u_data[..u_copy_len].copy_from_slice(&data[y_size..y_size + u_copy_len]);
+
+        // Copy V plane
+        let v_copy_len = v_data.len().min(uv_size);
+        v_data[..v_copy_len].copy_from_slice(&data[y_size + uv_size..y_size + uv_size + v_copy_len]);
+    }
+
+    // Calculate timestamp in microseconds relative to first frame
+    let first_ts = ctx.first_video_timestamp_ms.load(Ordering::Relaxed);
+    let relative_ts_ms = timestamp_ms - first_ts;
+    let timestamp_us = relative_ts_ms * 1000;
+
+    // Create and capture frame
+    let frame = VideoFrame {
+        rotation: VideoRotation::VideoRotation0,
+        timestamp_us,
+        buffer: i420,
+    };
+    source.capture_frame(&frame);
+
+    // Log every 30 frames
+    if count % 30 == 1 {
+        eprintln!(
+            "[TRACE] Video frame #{}: {}x{} ts={}ms keyframe={}",
+            count, width, height, timestamp_ms, is_keyframe
+        );
+    }
+}
+
+/// Feed an audio frame to the audio source
+async fn feed_audio_frame(
+    ctx: &Arc<CallbackContext>,
+    source: &NativeAudioSource,
+    data: &[u8],
+    timestamp_ms: i64,
+) -> Result<()> {
+    let count = ctx.audio_frame_count.fetch_add(1, Ordering::Relaxed) + 1;
+
+    ctx.last_audio_timestamp_ms
+        .store(timestamp_ms, Ordering::Relaxed);
+
+    // Convert PCM S16LE bytes to i16 samples
+    let samples: Vec<i16> = data
+        .chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect();
+
+    let sample_rate = source.sample_rate();
+    let num_channels = source.num_channels();
+    let samples_per_channel = (samples.len() / num_channels as usize) as u32;
+
+    // Track total samples for statistics
+    ctx.audio_total_samples
+        .fetch_add(samples_per_channel as u64, Ordering::Relaxed);
+
+    // Create and capture audio frame
+    let frame = AudioFrame {
+        data: Cow::Owned(samples),
+        sample_rate,
+        num_channels,
+        samples_per_channel,
+    };
+
+    source
+        .capture_frame(&frame)
+        .await
+        .map_err(|e| anyhow!("Failed to capture audio frame: {}", e.message))?;
+
+    // Log every 100 frames
+    if count % 100 == 1 {
+        eprintln!(
+            "[TRACE] Audio frame #{}: {}Hz {}ch {} samples ts={}ms",
+            count, sample_rate, num_channels, samples_per_channel, timestamp_ms
+        );
+    }
+
+    Ok(())
 }
 
 /// Extract webrtc-sys RtpSender from libwebrtc RtpSender

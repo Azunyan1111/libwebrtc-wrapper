@@ -56,8 +56,9 @@ check:
 
 # Docker build for Ubuntu (builds inside container, extracts binary)
 docker-release-ubuntu:
-	docker build --platform linux/amd64 -t whep-client-ubuntu -f Dockerfile.ubuntu .
-	docker create --name whep-extract whep-client-ubuntu
-	docker cp whep-extract:/workspace/target/release/whep-client ./whep-client-ubuntu
-	docker rm whep-extract
-	@echo "Built: ./whep-client-ubuntu"
+	docker build --platform linux/amd64 -t libwebrtc-wrapper-ubuntu -f Dockerfile.ubuntu .
+	docker create --name libwebrtc-extract libwebrtc-wrapper-ubuntu
+	docker cp libwebrtc-extract:/workspace/target/release/whep-client ./whep-client-u
+	docker cp libwebrtc-extract:/workspace/target/release/whip-client ./whip-client-u
+	docker rm libwebrtc-extract
+	@echo "Built: ./whep-client-u ./whip-client-u"

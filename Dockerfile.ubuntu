@@ -40,4 +40,4 @@ ENV CC=clang
 RUN cargo build --release
 
 # Output binary location
-RUN ls -la target/release/whep-client
+RUN ls -la target/release/whep-client target/release/whip-client

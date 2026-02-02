@@ -8,7 +8,8 @@
 /libwebrtc/
 /rust-sdks/
 webrtc.*.tar.gz
-whep-client-ubuntu
+whep-client-u
+whip-client-u
 test_verify/
 .serena
 # Test output (generated media files)
