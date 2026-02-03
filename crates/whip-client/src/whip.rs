@@ -17,13 +17,18 @@ use libwebrtc::video_source::native::NativeVideoSource;
 use libwebrtc::video_source::VideoResolution;
 use reqwest::header::HeaderMap;
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use url::Url;
+
+const AUDIO_QUEUE_SIZE_MS: u32 = 100;
+const LATE_DROP_THRESHOLD_MS: i64 = 200;
 
 /// WHIP Client for sending WebRTC streams
 pub struct WhipClient {
@@ -52,6 +57,8 @@ pub struct CallbackContext {
     pub ice_gathering_complete: AtomicBool,
     pub ice_candidate_tx: mpsc::UnboundedSender<IceCandidate>,
     // Timestamp tracking
+    pub pacing_pts_start_ms: OnceLock<i64>,
+    pub pacing_wall_start: OnceLock<Instant>,
     pub first_video_timestamp_ms: AtomicI64,
     pub first_audio_timestamp_ms: AtomicI64,
     pub first_audio_mkv_timestamp_ms: AtomicI64,
@@ -128,6 +135,8 @@ impl WhipClient {
             audio_frame_count: AtomicU64::new(0),
             ice_gathering_complete: AtomicBool::new(false),
             ice_candidate_tx: ice_tx,
+            pacing_pts_start_ms: OnceLock::new(),
+            pacing_wall_start: OnceLock::new(),
             first_video_timestamp_ms: AtomicI64::new(-1),
             first_audio_timestamp_ms: AtomicI64::new(-1),
             first_audio_mkv_timestamp_ms: AtomicI64::new(-1),
@@ -172,7 +181,7 @@ impl WhipClient {
         );
         // queue_size_ms: 0 = no buffering, requires 10ms frames
         // Non-zero enables buffering (in 10ms units)
-        let queue_size_ms = 0; // no buffering (requires 10ms frames)
+        let queue_size_ms = AUDIO_QUEUE_SIZE_MS; // small buffering for jitter absorption
         let audio_source = NativeAudioSource::new(
             AudioSourceOptions::default(),
             audio_sample_rate,
@@ -390,7 +399,6 @@ impl WhipClient {
         // ビデオタスク: ペーシング + フレーム投入
         let video_ctx = ctx.clone();
         let video_task = tokio::spawn(async move {
-            let mut pacing_base: Option<(Instant, i64)> = None;
             while let Some(frame) = video_rx.recv().await {
                 video_ctx
                     .video_queue_backlog
@@ -401,11 +409,10 @@ impl WhipClient {
                     ..
                 } = &frame
                 {
-                    let (wall_start, first_ts) = pacing_base.get_or_insert_with(|| {
-                        (Instant::now(), *timestamp_ms)
-                    });
+                    let (wall_start, pts_start_ms) =
+                        ensure_pacing_base(&video_ctx, *timestamp_ms);
                     let elapsed_ms = wall_start.elapsed().as_millis() as i64;
-                    let target_ms = *timestamp_ms - *first_ts;
+                    let target_ms = *timestamp_ms - pts_start_ms;
                     let wait_ms = target_ms - elapsed_ms;
                     let drift_ms = elapsed_ms - target_ms;
                     video_ctx
@@ -430,9 +437,15 @@ impl WhipClient {
             Ok::<(), anyhow::Error>(())
         });
 
-        // オーディオタスク: 10msフレーム化 + サンプル時計でペーシング
+        // オーディオタスク: 10msフレーム化 + MKV PTSでペーシング
         let audio_ctx = ctx.clone();
         let audio_task = tokio::spawn(async move {
+            struct AudioSegment {
+                pts_ms: i64,
+                samples: Vec<i16>,
+                offset: usize,
+            }
+
             let audio_sample_rate_u32 = audio_sample_rate;
             let audio_channels_u32 = audio_source.num_channels();
             if audio_sample_rate_u32 == 0 || audio_channels_u32 == 0 {
@@ -443,10 +456,8 @@ impl WhipClient {
             let num_channels = audio_channels_u32 as usize;
             let chunk_samples = samples_per_10ms * num_channels;
 
-            let mut audio_buffer: Vec<i16> = Vec::new();
-            let mut audio_buffer_offset = 0usize;
-            let mut audio_clock_samples: u64 = 0;
-            let mut pacing_base: Option<(Instant, i64)> = None;
+            let mut segments: VecDeque<AudioSegment> = VecDeque::new();
+            let mut pending_samples = 0usize;
 
             while let Some(frame) = audio_rx.recv().await {
                 audio_ctx
@@ -459,33 +470,89 @@ impl WhipClient {
                     for chunk in payload.chunks_exact(2) {
                         samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                     }
-                    audio_buffer.extend(samples);
+                    if samples.is_empty() {
+                        continue;
+                    }
 
-                    while audio_buffer.len().saturating_sub(audio_buffer_offset) >= chunk_samples {
-                        let end = audio_buffer_offset + chunk_samples;
-                        let chunk = audio_buffer[audio_buffer_offset..end].to_vec();
-                        audio_buffer_offset = end;
+                    pending_samples += samples.len();
+                    segments.push_back(AudioSegment {
+                        pts_ms: mkv_timestamp_ms,
+                        samples,
+                        offset: 0,
+                    });
 
-                        if audio_buffer_offset > 4096
-                            && audio_buffer_offset > audio_buffer.len() / 2
-                        {
-                            audio_buffer.drain(..audio_buffer_offset);
-                            audio_buffer_offset = 0;
+                    while pending_samples >= chunk_samples {
+                        let mut chunk = Vec::with_capacity(chunk_samples);
+                        let mut chunk_pts_ms: Option<i64> = None;
+                        let mut chunk_pts_offset = 0usize;
+
+                        while chunk.len() < chunk_samples {
+                            let Some(front) = segments.front_mut() else {
+                                break;
+                            };
+
+                            if chunk_pts_ms.is_none() {
+                                chunk_pts_ms = Some(front.pts_ms);
+                                chunk_pts_offset = front.offset;
+                            }
+
+                            let available = front.samples.len().saturating_sub(front.offset);
+                            let remaining = chunk_samples - chunk.len();
+                            let take = remaining.min(available);
+
+                            if take == 0 {
+                                break;
+                            }
+
+                            let end = front.offset + take;
+                            chunk.extend_from_slice(&front.samples[front.offset..end]);
+                            front.offset = end;
+                            pending_samples = pending_samples.saturating_sub(take);
+
+                            if front.offset >= front.samples.len() {
+                                segments.pop_front();
+                            }
                         }
 
-                        audio_clock_samples += samples_per_10ms as u64;
-                        let target_ms =
-                            (audio_clock_samples * 1000 / audio_sample_rate_u32 as u64) as i64;
-                        let (wall_start, first_target_ms) = pacing_base.get_or_insert_with(|| {
-                            (Instant::now(), target_ms)
-                        });
+                        if chunk.len() < chunk_samples {
+                            break;
+                        }
+
+                        let Some(base_pts_ms) = chunk_pts_ms else {
+                            break;
+                        };
+                        let offset_per_channel = chunk_pts_offset / num_channels;
+                        let chunk_pts_ms = base_pts_ms
+                            + ((offset_per_channel as u64 * 1000 / audio_sample_rate_u32 as u64)
+                                as i64);
+
+                        if audio_ctx
+                            .first_audio_mkv_timestamp_ms
+                            .load(Ordering::Relaxed)
+                            < 0
+                        {
+                            audio_ctx
+                                .first_audio_mkv_timestamp_ms
+                                .store(chunk_pts_ms, Ordering::Relaxed);
+                        }
+                        audio_ctx
+                            .last_audio_mkv_timestamp_ms
+                            .store(chunk_pts_ms, Ordering::Relaxed);
+
+                        let (wall_start, pts_start_ms) =
+                            ensure_pacing_base(&audio_ctx, chunk_pts_ms);
                         let elapsed_ms = wall_start.elapsed().as_millis() as i64;
-                        let target_rel_ms = target_ms - *first_target_ms;
+                        let target_rel_ms = chunk_pts_ms - pts_start_ms;
                         let wait_ms = target_rel_ms - elapsed_ms;
                         let drift_ms = elapsed_ms - target_rel_ms;
                         audio_ctx
                             .last_audio_drift_ms
                             .store(drift_ms, Ordering::Relaxed);
+
+                        if drift_ms > LATE_DROP_THRESHOLD_MS {
+                            continue;
+                        }
+
                         if wait_ms > 0 {
                             tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms as u64))
                                 .await;
@@ -496,8 +563,8 @@ impl WhipClient {
                             &audio_source,
                             chunk,
                             samples_per_10ms as u32,
-                            target_ms,
-                            mkv_timestamp_ms,
+                            chunk_pts_ms,
+                            chunk_pts_ms,
                         )
                         .await?;
                     }
@@ -599,6 +666,7 @@ impl WhipClient {
                     ctx.last_audio_mkv_timestamp_ms.load(Ordering::Relaxed);
                 let first_audio_mkv_ts =
                     ctx.first_audio_mkv_timestamp_ms.load(Ordering::Relaxed);
+                let first_audio_ts = ctx.first_audio_timestamp_ms.load(Ordering::Relaxed);
                 let audio_total_samples = ctx.audio_total_samples.load(Ordering::Relaxed);
                 let last_video_drift_ms = ctx.last_video_drift_ms.load(Ordering::Relaxed);
                 let last_audio_drift_ms = ctx.last_audio_drift_ms.load(Ordering::Relaxed);
@@ -620,8 +688,8 @@ impl WhipClient {
                 } else {
                     -1
                 };
-                let audio_clock_ms = if audio_sample_rate > 0 {
-                    (audio_total_samples * 1000 / audio_sample_rate as u64) as i64
+                let audio_clock_ms = if last_audio_ts >= 0 && first_audio_ts >= 0 {
+                    last_audio_ts - first_audio_ts
                 } else {
                     -1
                 };
@@ -1047,6 +1115,12 @@ fn parse_param_value(value: &str) -> Option<String> {
     }
 }
 
+fn ensure_pacing_base(ctx: &Arc<CallbackContext>, pts_ms: i64) -> (Instant, i64) {
+    let pts_start_ms = *ctx.pacing_pts_start_ms.get_or_init(|| pts_ms);
+    let wall_start = *ctx.pacing_wall_start.get_or_init(Instant::now);
+    (wall_start, pts_start_ms)
+}
+
 /// Feed a video frame to the video source
 fn feed_video_frame(
     ctx: &Arc<CallbackContext>,
@@ -1136,8 +1210,10 @@ async fn feed_audio_frame(
     if count == 1 {
         ctx.first_audio_timestamp_ms
             .store(audio_clock_ms, Ordering::Relaxed);
-        ctx.first_audio_mkv_timestamp_ms
-            .store(mkv_timestamp_ms, Ordering::Relaxed);
+        if ctx.first_audio_mkv_timestamp_ms.load(Ordering::Relaxed) < 0 {
+            ctx.first_audio_mkv_timestamp_ms
+                .store(mkv_timestamp_ms, Ordering::Relaxed);
+        }
         eprintln!(
             "[INFO] First audio frame: ts={}ms mkv_ts={}ms",
             audio_clock_ms,
