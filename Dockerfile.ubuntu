@@ -32,6 +32,7 @@ WORKDIR /workspace
 # Copy source code (libwebrtc crate downloads WebRTC automatically)
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
+COPY rust-sdks ./rust-sdks
 
 # Build (libwebrtc crate will download and setup WebRTC during build)
 # Use clang++ as the C++ compiler (required for webrtc-sys compatibility)
