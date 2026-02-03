@@ -23,6 +23,7 @@ use std::io::{self, BufReader};
 struct AppConfig {
     whip_url: String,
     debug: bool,
+    debug_libwebrtc: bool,
     #[allow(dead_code)]
     output_file: Option<String>,
 }
@@ -33,6 +34,7 @@ fn parse_args() -> AppConfig {
 
     let mut whip_url = String::new();
     let mut debug = false;
+    let mut debug_libwebrtc = false;
     let mut output_file = None;
 
     let mut i = 1;
@@ -46,7 +48,8 @@ fn parse_args() -> AppConfig {
                 eprintln!();
                 eprintln!("Options:");
                 eprintln!("  -h, --help              Show this help message");
-                eprintln!("  -d, --debug             Enable debug logging");
+                eprintln!("  -d, --debug             Enable debug logging (this project)");
+                eprintln!("  -dlibwebrtc             Enable libwebrtc debug logging");
                 eprintln!("  -o, --output <FILE>     Output file for received stream (optional)");
                 eprintln!();
                 eprintln!("Input: MKV (Matroska) format from stdin");
@@ -70,6 +73,10 @@ fn parse_args() -> AppConfig {
             }
             "-d" | "--debug" => {
                 debug = true;
+                i += 1;
+            }
+            "-dlibwebrtc" => {
+                debug_libwebrtc = true;
                 i += 1;
             }
             "-o" | "--output" => {
@@ -102,12 +109,13 @@ fn parse_args() -> AppConfig {
     AppConfig {
         whip_url,
         debug,
+        debug_libwebrtc,
         output_file,
     }
 }
 
-fn init_tracing(debug: bool) {
-    if !debug {
+fn init_tracing(debug_libwebrtc: bool) {
+    if !debug_libwebrtc {
         return;
     }
 
@@ -125,7 +133,7 @@ async fn main() -> Result<()> {
     eprintln!("[INFO] WHIP Client starting...");
 
     let config = parse_args();
-    init_tracing(config.debug);
+    init_tracing(config.debug_libwebrtc);
 
     eprintln!("[INFO] Reading MKV from stdin...");
 

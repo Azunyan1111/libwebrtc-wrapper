@@ -14,6 +14,10 @@ repository = "https://github.com/Azunyan1111/libwebrtc-wrapper"
 [workspace.dependencies]
 # WebRTC (LiveKit)
 libwebrtc = "0.3"
+livekit-protocol = { version = "0.6.0", path = "rust-sdks/livekit-protocol" }
+livekit-runtime = { version = "0.4.0", path = "rust-sdks/livekit-runtime" }
+webrtc-sys = { version = "0.3.21", path = "rust-sdks/webrtc-sys" }
+webrtc-sys-build = { version = "0.3.12", path = "rust-sdks/webrtc-sys/build" }
 
 # Build
 cc = "1"
@@ -41,3 +45,7 @@ bytes = "1"
 
 # URL parsing
 url = "2"
+
+[patch.crates-io]
+libwebrtc = { path = "rust-sdks/libwebrtc" }
+webrtc-sys = { path = "rust-sdks/webrtc-sys" }

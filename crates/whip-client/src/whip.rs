@@ -42,6 +42,7 @@ pub struct WhipClient {
     // Video dimensions
     video_width: u32,
     video_height: u32,
+    audio_sample_rate: u32,
 }
 
 /// Context for frame counting, statistics, and ICE management.
@@ -52,9 +53,22 @@ pub struct CallbackContext {
     pub ice_candidate_tx: mpsc::UnboundedSender<IceCandidate>,
     // Timestamp tracking
     pub first_video_timestamp_ms: AtomicI64,
+    pub first_audio_timestamp_ms: AtomicI64,
+    pub first_audio_mkv_timestamp_ms: AtomicI64,
     pub audio_total_samples: AtomicU64,
     pub last_video_timestamp_ms: AtomicI64,
     pub last_audio_timestamp_ms: AtomicI64,
+    pub last_audio_mkv_timestamp_ms: AtomicI64,
+    pub last_video_drift_ms: AtomicI64,
+    pub last_audio_drift_ms: AtomicI64,
+    pub last_audio_capture_wait_ms: AtomicI64,
+    pub audio_capture_wait_total_ms: AtomicU64,
+    pub audio_capture_wait_count: AtomicU64,
+    pub audio_capture_wait_max_ms: AtomicI64,
+    pub video_queue_backlog: AtomicI64,
+    pub audio_queue_backlog: AtomicI64,
+    pub video_queue_backlog_max: AtomicI64,
+    pub audio_queue_backlog_max: AtomicI64,
 }
 
 impl WhipClient {
@@ -76,6 +90,7 @@ impl WhipClient {
             audio_source: None,
             video_width: 0,
             video_height: 0,
+            audio_sample_rate: 0,
         })
     }
 
@@ -91,6 +106,7 @@ impl WhipClient {
 
         self.video_width = video_width;
         self.video_height = video_height;
+        self.audio_sample_rate = audio_sample_rate;
 
         // Create factory
         let factory = PeerConnectionFactory::default();
@@ -113,9 +129,22 @@ impl WhipClient {
             ice_gathering_complete: AtomicBool::new(false),
             ice_candidate_tx: ice_tx,
             first_video_timestamp_ms: AtomicI64::new(-1),
+            first_audio_timestamp_ms: AtomicI64::new(-1),
+            first_audio_mkv_timestamp_ms: AtomicI64::new(-1),
             audio_total_samples: AtomicU64::new(0),
             last_video_timestamp_ms: AtomicI64::new(-1),
             last_audio_timestamp_ms: AtomicI64::new(-1),
+            last_audio_mkv_timestamp_ms: AtomicI64::new(-1),
+            last_video_drift_ms: AtomicI64::new(-1),
+            last_audio_drift_ms: AtomicI64::new(-1),
+            last_audio_capture_wait_ms: AtomicI64::new(-1),
+            audio_capture_wait_total_ms: AtomicU64::new(0),
+            audio_capture_wait_count: AtomicU64::new(0),
+            audio_capture_wait_max_ms: AtomicI64::new(-1),
+            video_queue_backlog: AtomicI64::new(0),
+            audio_queue_backlog: AtomicI64::new(0),
+            video_queue_backlog_max: AtomicI64::new(0),
+            audio_queue_backlog_max: AtomicI64::new(0),
         });
         self.callback_context = Some(ctx.clone());
         self.ice_candidate_rx = Some(ice_rx);
@@ -143,7 +172,7 @@ impl WhipClient {
         );
         // queue_size_ms: 0 = no buffering, requires 10ms frames
         // Non-zero enables buffering (in 10ms units)
-        let queue_size_ms = 100; // 100ms buffer
+        let queue_size_ms = 0; // no buffering (requires 10ms frames)
         let audio_source = NativeAudioSource::new(
             AudioSourceOptions::default(),
             audio_sample_rate,
@@ -351,6 +380,7 @@ impl WhipClient {
 
         let video_width = self.video_width;
         let video_height = self.video_height;
+        let audio_sample_rate = self.audio_sample_rate;
         let debug = self.debug;
 
         // unbounded channel: stdinからのMKV読取は自然にペーシングされるため安全
@@ -362,6 +392,9 @@ impl WhipClient {
         let video_task = tokio::spawn(async move {
             let mut pacing_base: Option<(Instant, i64)> = None;
             while let Some(frame) = video_rx.recv().await {
+                video_ctx
+                    .video_queue_backlog
+                    .fetch_sub(1, Ordering::Relaxed);
                 if let MkvFrame::Video {
                     timestamp_ms,
                     is_keyframe,
@@ -374,6 +407,10 @@ impl WhipClient {
                     let elapsed_ms = wall_start.elapsed().as_millis() as i64;
                     let target_ms = *timestamp_ms - *first_ts;
                     let wait_ms = target_ms - elapsed_ms;
+                    let drift_ms = elapsed_ms - target_ms;
+                    video_ctx
+                        .last_video_drift_ms
+                        .store(drift_ms, Ordering::Relaxed);
                     if wait_ms > 0 {
                         tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms as u64)).await;
                     }
@@ -393,13 +430,79 @@ impl WhipClient {
             Ok::<(), anyhow::Error>(())
         });
 
-        // オーディオタスク: フレーム投入（NativeAudioSourceのバックプレッシャーで自然にペーシング）
+        // オーディオタスク: 10msフレーム化 + サンプル時計でペーシング
         let audio_ctx = ctx.clone();
         let audio_task = tokio::spawn(async move {
+            let audio_sample_rate_u32 = audio_sample_rate;
+            let audio_channels_u32 = audio_source.num_channels();
+            if audio_sample_rate_u32 == 0 || audio_channels_u32 == 0 {
+                return Err(anyhow!("Invalid audio configuration"));
+            }
+
+            let samples_per_10ms = (audio_sample_rate_u32 / 100) as usize;
+            let num_channels = audio_channels_u32 as usize;
+            let chunk_samples = samples_per_10ms * num_channels;
+
+            let mut audio_buffer: Vec<i16> = Vec::new();
+            let mut audio_buffer_offset = 0usize;
+            let mut audio_clock_samples: u64 = 0;
+            let mut pacing_base: Option<(Instant, i64)> = None;
+
             while let Some(frame) = audio_rx.recv().await {
+                audio_ctx
+                    .audio_queue_backlog
+                    .fetch_sub(1, Ordering::Relaxed);
                 if let MkvFrame::Audio { timestamp_ms, .. } = &frame {
+                    let mkv_timestamp_ms = *timestamp_ms;
                     let payload = frame.payload();
-                    feed_audio_frame(&audio_ctx, &audio_source, payload, *timestamp_ms).await?;
+                    let mut samples = Vec::with_capacity(payload.len() / 2);
+                    for chunk in payload.chunks_exact(2) {
+                        samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+                    }
+                    audio_buffer.extend(samples);
+
+                    while audio_buffer.len().saturating_sub(audio_buffer_offset) >= chunk_samples {
+                        let end = audio_buffer_offset + chunk_samples;
+                        let chunk = audio_buffer[audio_buffer_offset..end].to_vec();
+                        audio_buffer_offset = end;
+
+                        if audio_buffer_offset > 4096
+                            && audio_buffer_offset > audio_buffer.len() / 2
+                        {
+                            audio_buffer.drain(..audio_buffer_offset);
+                            audio_buffer_offset = 0;
+                        }
+
+                        audio_clock_samples += samples_per_10ms as u64;
+                        let target_ms =
+                            (audio_clock_samples * 1000 / audio_sample_rate_u32 as u64) as i64;
+                        let (wall_start, first_target_ms) = pacing_base.get_or_insert_with(|| {
+                            (Instant::now(), target_ms)
+                        });
+                        let elapsed_ms = wall_start.elapsed().as_millis() as i64;
+                        let target_rel_ms = target_ms - *first_target_ms;
+                        let wait_ms = target_rel_ms - elapsed_ms;
+                        let drift_ms = elapsed_ms - target_rel_ms;
+                        audio_ctx
+                            .last_audio_drift_ms
+                            .store(drift_ms, Ordering::Relaxed);
+                        if wait_ms > 0 {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms as u64))
+                                .await;
+                        }
+
+                        feed_audio_frame(
+                            &audio_ctx,
+                            &audio_source,
+                            chunk,
+                            samples_per_10ms as u32,
+                            target_ms,
+                            mkv_timestamp_ms,
+                        )
+                        .await?;
+                    }
+                } else {
+                    continue;
                 }
             }
             Ok::<(), anyhow::Error>(())
@@ -431,10 +534,40 @@ impl WhipClient {
                             if video_tx.send(frame).is_err() {
                                 break Err(anyhow!("Video task terminated unexpectedly"));
                             }
+                            let new_backlog =
+                                ctx.video_queue_backlog.fetch_add(1, Ordering::Relaxed) + 1;
+                            let mut current_max =
+                                ctx.video_queue_backlog_max.load(Ordering::Relaxed);
+                            while new_backlog > current_max {
+                                match ctx.video_queue_backlog_max.compare_exchange(
+                                    current_max,
+                                    new_backlog,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                ) {
+                                    Ok(_) => break,
+                                    Err(actual) => current_max = actual,
+                                }
+                            }
                         }
                         MkvFrame::Audio { .. } => {
                             if audio_tx.send(frame).is_err() {
                                 break Err(anyhow!("Audio task terminated unexpectedly"));
+                            }
+                            let new_backlog =
+                                ctx.audio_queue_backlog.fetch_add(1, Ordering::Relaxed) + 1;
+                            let mut current_max =
+                                ctx.audio_queue_backlog_max.load(Ordering::Relaxed);
+                            while new_backlog > current_max {
+                                match ctx.audio_queue_backlog_max.compare_exchange(
+                                    current_max,
+                                    new_backlog,
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                ) {
+                                    Ok(_) => break,
+                                    Err(actual) => current_max = actual,
+                                }
                             }
                         }
                     }
@@ -462,6 +595,47 @@ impl WhipClient {
                 let audio_count = ctx.audio_frame_count.load(Ordering::Relaxed);
                 let last_video_ts = ctx.last_video_timestamp_ms.load(Ordering::Relaxed);
                 let last_audio_ts = ctx.last_audio_timestamp_ms.load(Ordering::Relaxed);
+                let last_audio_mkv_ts =
+                    ctx.last_audio_mkv_timestamp_ms.load(Ordering::Relaxed);
+                let first_audio_mkv_ts =
+                    ctx.first_audio_mkv_timestamp_ms.load(Ordering::Relaxed);
+                let audio_total_samples = ctx.audio_total_samples.load(Ordering::Relaxed);
+                let last_video_drift_ms = ctx.last_video_drift_ms.load(Ordering::Relaxed);
+                let last_audio_drift_ms = ctx.last_audio_drift_ms.load(Ordering::Relaxed);
+                let last_audio_capture_wait_ms =
+                    ctx.last_audio_capture_wait_ms.load(Ordering::Relaxed);
+                let audio_capture_wait_total_ms =
+                    ctx.audio_capture_wait_total_ms.load(Ordering::Relaxed);
+                let audio_capture_wait_count = ctx.audio_capture_wait_count.load(Ordering::Relaxed);
+                let audio_capture_wait_max_ms =
+                    ctx.audio_capture_wait_max_ms.load(Ordering::Relaxed);
+                let video_queue_backlog = ctx.video_queue_backlog.load(Ordering::Relaxed);
+                let audio_queue_backlog = ctx.audio_queue_backlog.load(Ordering::Relaxed);
+                let video_queue_backlog_max =
+                    ctx.video_queue_backlog_max.load(Ordering::Relaxed);
+                let audio_queue_backlog_max =
+                    ctx.audio_queue_backlog_max.load(Ordering::Relaxed);
+                let audio_capture_wait_avg_ms = if audio_capture_wait_count > 0 {
+                    (audio_capture_wait_total_ms / audio_capture_wait_count) as i64
+                } else {
+                    -1
+                };
+                let audio_clock_ms = if audio_sample_rate > 0 {
+                    (audio_total_samples * 1000 / audio_sample_rate as u64) as i64
+                } else {
+                    -1
+                };
+                let mkv_audio_elapsed_ms =
+                    if last_audio_mkv_ts >= 0 && first_audio_mkv_ts >= 0 {
+                        last_audio_mkv_ts - first_audio_mkv_ts
+                } else {
+                    -1
+                };
+                let audio_mkv_diff_ms = if audio_clock_ms >= 0 && mkv_audio_elapsed_ms >= 0 {
+                    mkv_audio_elapsed_ms - audio_clock_ms
+                } else {
+                    -1
+                };
                 let av_diff = if last_video_ts >= 0 && last_audio_ts >= 0 {
                     last_video_ts - last_audio_ts
                 } else {
@@ -471,14 +645,28 @@ impl WhipClient {
                 let audio_delta = audio_count.saturating_sub(last_audio_count);
 
                 eprintln!(
-                    "[DEBUG] Frame stats: video={} (+{}), audio={} (+{}), last_video_ts={}ms, last_audio_ts={}ms, av_diff={}ms",
+                    "[DEBUG] Frame stats: video={} (+{}), audio={} (+{}), last_video_ts={}ms, last_audio_ts={}ms, last_audio_mkv_ts={}ms, av_diff={}ms, audio_total_samples={}, audio_clock_ms={}, mkv_audio_elapsed_ms={}, audio_mkv_diff_ms={}, last_video_drift_ms={}, last_audio_drift_ms={}, last_audio_capture_wait_ms={}, audio_capture_wait_avg_ms={}, audio_capture_wait_max_ms={}, video_queue_backlog={}, audio_queue_backlog={}, video_queue_backlog_max={}, audio_queue_backlog_max={}",
                     video_count,
                     video_delta,
                     audio_count,
                     audio_delta,
                     last_video_ts,
                     last_audio_ts,
-                    av_diff
+                    last_audio_mkv_ts,
+                    av_diff,
+                    audio_total_samples,
+                    audio_clock_ms,
+                    mkv_audio_elapsed_ms,
+                    audio_mkv_diff_ms,
+                    last_video_drift_ms,
+                    last_audio_drift_ms,
+                    last_audio_capture_wait_ms,
+                    audio_capture_wait_avg_ms,
+                    audio_capture_wait_max_ms,
+                    video_queue_backlog,
+                    audio_queue_backlog,
+                    video_queue_backlog_max,
+                    audio_queue_backlog_max
                 );
 
                 last_video_count = video_count;
@@ -938,23 +1126,36 @@ fn feed_video_frame(
 async fn feed_audio_frame(
     ctx: &Arc<CallbackContext>,
     source: &NativeAudioSource,
-    data: &[u8],
-    timestamp_ms: i64,
+    samples: Vec<i16>,
+    samples_per_channel: u32,
+    audio_clock_ms: i64,
+    mkv_timestamp_ms: i64,
 ) -> Result<()> {
     let count = ctx.audio_frame_count.fetch_add(1, Ordering::Relaxed) + 1;
 
-    ctx.last_audio_timestamp_ms
-        .store(timestamp_ms, Ordering::Relaxed);
+    if count == 1 {
+        ctx.first_audio_timestamp_ms
+            .store(audio_clock_ms, Ordering::Relaxed);
+        ctx.first_audio_mkv_timestamp_ms
+            .store(mkv_timestamp_ms, Ordering::Relaxed);
+        eprintln!(
+            "[INFO] First audio frame: ts={}ms mkv_ts={}ms",
+            audio_clock_ms,
+            mkv_timestamp_ms
+        );
+    }
 
-    // Convert PCM S16LE bytes to i16 samples
-    let samples: Vec<i16> = data
-        .chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
-        .collect();
+    ctx.last_audio_timestamp_ms
+        .store(audio_clock_ms, Ordering::Relaxed);
+    ctx.last_audio_mkv_timestamp_ms
+        .store(mkv_timestamp_ms, Ordering::Relaxed);
+    if ctx.first_audio_mkv_timestamp_ms.load(Ordering::Relaxed) < 0 {
+        ctx.first_audio_mkv_timestamp_ms
+            .store(mkv_timestamp_ms, Ordering::Relaxed);
+    }
 
     let sample_rate = source.sample_rate();
     let num_channels = source.num_channels();
-    let samples_per_channel = (samples.len() / num_channels as usize) as u32;
 
     // Track total samples for statistics
     ctx.audio_total_samples
@@ -968,16 +1169,38 @@ async fn feed_audio_frame(
         samples_per_channel,
     };
 
+    let capture_start = Instant::now();
     source
         .capture_frame(&frame)
         .await
         .map_err(|e| anyhow!("Failed to capture audio frame: {}", e.message))?;
+    let capture_wait_ms = capture_start.elapsed().as_millis() as i64;
+    ctx.last_audio_capture_wait_ms
+        .store(capture_wait_ms, Ordering::Relaxed);
+    ctx.audio_capture_wait_total_ms.fetch_add(
+        capture_wait_ms.max(0) as u64,
+        Ordering::Relaxed,
+    );
+    ctx.audio_capture_wait_count
+        .fetch_add(1, Ordering::Relaxed);
+    let mut current_max = ctx.audio_capture_wait_max_ms.load(Ordering::Relaxed);
+    while capture_wait_ms > current_max {
+        match ctx.audio_capture_wait_max_ms.compare_exchange(
+            current_max,
+            capture_wait_ms,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current_max = actual,
+        }
+    }
 
     // Log every 100 frames
     if count % 100 == 1 {
         eprintln!(
-            "[TRACE] Audio frame #{}: {}Hz {}ch {} samples ts={}ms",
-            count, sample_rate, num_channels, samples_per_channel, timestamp_ms
+            "[TRACE] Audio frame #{}: {}Hz {}ch {} samples ts={}ms mkv_ts={}ms",
+            count, sample_rate, num_channels, samples_per_channel, audio_clock_ms, mkv_timestamp_ms
         );
     }
 
