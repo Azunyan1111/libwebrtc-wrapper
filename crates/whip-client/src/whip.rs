@@ -1243,6 +1243,8 @@ async fn feed_audio_frame(
         sample_rate,
         num_channels,
         samples_per_channel,
+        callback_time_ms: 0,
+        absolute_capture_timestamp_ms: None,
     };
 
     let capture_start = Instant::now();
