@@ -1147,8 +1147,6 @@ checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 [[package]]
 name = "libwebrtc"
 version = "0.3.24"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb56165903078b7282ae45bd423439955b81e5a841e3a2fa46106c25cd62eda6"
 dependencies = [
  "cxx",
  "glib",
@@ -1193,8 +1191,6 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 [[package]]
 name = "livekit-protocol"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07b8d7580e14aa9039d6d1d13c06c894de7757b9a49c1aa7c188cabf461cf069"
 dependencies = [
  "futures-util",
  "livekit-runtime",
@@ -1210,8 +1206,6 @@ dependencies = [
 [[package]]
 name = "livekit-runtime"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "532e84c6cdc5fe774f2b5d9912597b5f3bea561927a48296d03e24549d21c3f6"
 dependencies = [
  "tokio",
  "tokio-stream",
@@ -2759,8 +2753,6 @@ dependencies = [
 [[package]]
 name = "webrtc-sys"
 version = "0.3.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "599fd49417d23c328aa4235906383939dc6530d36e00959f09df6edc7d3afbe0"
 dependencies = [
  "cc",
  "cxx",
@@ -2774,8 +2766,6 @@ dependencies = [
 [[package]]
 name = "webrtc-sys-build"
 version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d94b613d4d2c358e193b87b074eb919cee06d015a315fc898788c8cfd8f53a5d"
 dependencies = [
  "anyhow",
  "fs2",
