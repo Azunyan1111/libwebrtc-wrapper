@@ -28,7 +28,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 const AUDIO_QUEUE_SIZE_MS: u32 = 100;
-const LATE_DROP_THRESHOLD_MS: i64 = 200;
+const LATE_DROP_THRESHOLD_MS: i64 = 150;
 
 /// WHIP Client for sending WebRTC streams
 pub struct WhipClient {
@@ -181,7 +181,7 @@ impl WhipClient {
         );
         // queue_size_ms: 0 = no buffering, requires 10ms frames
         // Non-zero enables buffering (in 10ms units)
-        let queue_size_ms = AUDIO_QUEUE_SIZE_MS; // small buffering for jitter absorption
+        let queue_size_ms = AUDIO_QUEUE_SIZE_MS; // low-latency: disable internal buffering
         let audio_source = NativeAudioSource::new(
             AudioSourceOptions::default(),
             audio_sample_rate,
@@ -711,13 +711,21 @@ impl WhipClient {
                 };
                 let video_delta = video_count.saturating_sub(last_video_count);
                 let audio_delta = audio_count.saturating_sub(last_audio_count);
+                let interval_secs = last_debug_log.elapsed().as_secs_f64();
+                let video_fps = if interval_secs > 0.0 {
+                    video_delta as f64 / interval_secs
+                } else {
+                    0.0
+                };
 
                 eprintln!(
-                    "[DEBUG] Frame stats: video={} (+{}), audio={} (+{}), last_video_ts={}ms, last_audio_ts={}ms, last_audio_mkv_ts={}ms, av_diff={}ms, audio_total_samples={}, audio_clock_ms={}, mkv_audio_elapsed_ms={}, audio_mkv_diff_ms={}, last_video_drift_ms={}, last_audio_drift_ms={}, last_audio_capture_wait_ms={}, audio_capture_wait_avg_ms={}, audio_capture_wait_max_ms={}, video_queue_backlog={}, audio_queue_backlog={}, video_queue_backlog_max={}, audio_queue_backlog_max={}",
+                    "[DEBUG] Frame stats: video={} (+{}), audio={} (+{}), interval={:.2}s, video_fps={:.2}, last_video_ts={}ms, last_audio_ts={}ms, last_audio_mkv_ts={}ms, av_diff={}ms, audio_total_samples={}, audio_clock_ms={}, mkv_audio_elapsed_ms={}, audio_mkv_diff_ms={}, last_video_drift_ms={}, last_audio_drift_ms={}, last_audio_capture_wait_ms={}, audio_capture_wait_avg_ms={}, audio_capture_wait_max_ms={}, video_queue_backlog={}, audio_queue_backlog={}, video_queue_backlog_max={}, audio_queue_backlog_max={}",
                     video_count,
                     video_delta,
                     audio_count,
                     audio_delta,
+                    interval_secs,
+                    video_fps,
                     last_video_ts,
                     last_audio_ts,
                     last_audio_mkv_ts,
