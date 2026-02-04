@@ -529,6 +529,12 @@ impl WhepClient {
         let timestamp_ms = (timestamp_us - first_ts) / 1000;
         ctx.last_video_timestamp_ms
             .store(timestamp_ms, Ordering::Relaxed);
+        if self.debug && count % 30 == 1 {
+            eprintln!(
+                "[DEBUG] Video ts: read_us={}, write_ms={}, first_us={}",
+                timestamp_us, timestamp_ms, first_ts
+            );
+        }
 
         // Write to MKV without repacking into a contiguous buffer
         {
@@ -594,6 +600,13 @@ impl WhepClient {
         let timestamp_ms = (prev_samples as i64 * 1000) / sample_rate as i64;
         ctx.last_audio_timestamp_ms
             .store(timestamp_ms, Ordering::Relaxed);
+        if self.debug && count % 100 == 1 {
+            let total_samples = prev_samples + nb_frames as u64;
+            eprintln!(
+                "[DEBUG] Audio ts: read_ms={}, write_ms={}, total_samples={}",
+                timestamp_ms, timestamp_ms, total_samples
+            );
+        }
 
         // Convert PCM data to bytes (S16LE)
         let byte_data: &[u8] =

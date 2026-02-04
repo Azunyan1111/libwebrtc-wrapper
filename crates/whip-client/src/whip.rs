@@ -399,6 +399,7 @@ impl WhipClient {
         // ビデオタスク: ペーシング + フレーム投入
         let video_ctx = ctx.clone();
         let video_task = tokio::spawn(async move {
+            let mut video_log_count: u64 = 0;
             while let Some(frame) = video_rx.recv().await {
                 video_ctx
                     .video_queue_backlog
@@ -432,6 +433,19 @@ impl WhipClient {
                         video_width,
                         video_height,
                     );
+                    video_log_count = video_log_count.wrapping_add(1);
+                    if debug && video_log_count % 30 == 1 {
+                        let first_ts = video_ctx.first_video_timestamp_ms.load(Ordering::Relaxed);
+                        let write_ts_ms = if first_ts >= 0 {
+                            *timestamp_ms - first_ts
+                        } else {
+                            0
+                        };
+                        eprintln!(
+                            "[DEBUG] Video ts: read_ms={}, write_ms={}, first_read_ms={}",
+                            *timestamp_ms, write_ts_ms, first_ts
+                        );
+                    }
                 }
             }
             Ok::<(), anyhow::Error>(())
@@ -458,6 +472,7 @@ impl WhipClient {
 
             let mut segments: VecDeque<AudioSegment> = VecDeque::new();
             let mut pending_samples = 0usize;
+            let mut audio_log_count: u64 = 0;
 
             while let Some(frame) = audio_rx.recv().await {
                 audio_ctx
@@ -567,6 +582,13 @@ impl WhipClient {
                             chunk_pts_ms,
                         )
                         .await?;
+                        audio_log_count = audio_log_count.wrapping_add(1);
+                        if debug && audio_log_count % 100 == 1 {
+                            eprintln!(
+                                "[DEBUG] Audio ts: read_ms={}, write_ms={}",
+                                chunk_pts_ms, chunk_pts_ms
+                            );
+                        }
                     }
                 } else {
                     continue;
