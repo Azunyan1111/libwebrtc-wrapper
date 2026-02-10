@@ -379,13 +379,21 @@ impl WhepClient {
                     };
                     let video_delta = video_count.saturating_sub(last_video_count);
                     let audio_delta = audio_count.saturating_sub(last_audio_count);
+                    let interval_secs = last_debug_log.elapsed().as_secs_f64();
+                    let video_fps = if interval_secs > 0.0 {
+                        video_delta as f64 / interval_secs
+                    } else {
+                        0.0
+                    };
 
                     eprintln!(
-                        "[DEBUG] Frame stats: video={} (+{}), audio={} (+{}), last_video_ts={}ms, last_audio_ts={}ms, av_diff={}ms",
+                        "[DEBUG] Frame stats: video={} (+{}), audio={} (+{}), interval={:.2}s, video_fps={:.2}, last_video_ts={}ms, last_audio_ts={}ms, av_diff={}ms",
                         video_count,
                         video_delta,
                         audio_count,
                         audio_delta,
+                        interval_secs,
+                        video_fps,
                         last_video_ts,
                         last_audio_ts,
                         av_diff
