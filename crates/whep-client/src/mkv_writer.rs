@@ -238,13 +238,16 @@ impl<W: Write> MkvWriter<W> {
     }
 
     /// Check if we need to start a new cluster
-    fn maybe_start_new_cluster(&mut self, timestamp_ms: i64, is_keyframe: bool) -> Result<()> {
+    fn maybe_start_new_cluster(&mut self, timestamp_ms: i64, _is_keyframe: bool) -> Result<()> {
         let need_new_cluster = match self.cluster_start_time {
             None => true, // First frame
             Some(start) => {
                 let elapsed = timestamp_ms - start;
-                // New cluster on keyframe after threshold, or if elapsed time exceeds threshold
-                (is_keyframe && elapsed > 0) || elapsed >= CLUSTER_DURATION_MS
+                // SimpleBlock timestamp is signed int16 relative to Cluster Timestamp.
+                // Start a new cluster before it overflows.
+                elapsed >= CLUSTER_DURATION_MS
+                    || elapsed < i16::MIN as i64
+                    || elapsed > i16::MAX as i64
             }
         };
 
@@ -670,6 +673,25 @@ mod tests {
         // 5000ms: CLUSTER_DURATION_MS閾値で新クラスタ
         writer.write_video_frame(&[0u8; 6], 5000, false).unwrap();
         assert_eq!(writer.cluster_start_time, Some(5000));
+    }
+
+    #[test]
+    fn test_mkv_writer_keyframe_does_not_force_new_cluster() {
+        let buf = Vec::new();
+        let config = MkvConfig {
+            video_width: 2,
+            video_height: 2,
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+        };
+        let mut writer = MkvWriter::new(buf, config).unwrap();
+
+        writer.write_video_frame(&[0u8; 6], 0, true).unwrap();
+        assert_eq!(writer.cluster_start_time, Some(0));
+
+        // keyframe=true でも、閾値内なら同じクラスタを維持する
+        writer.write_video_frame(&[0u8; 6], 1, true).unwrap();
+        assert_eq!(writer.cluster_start_time, Some(0));
     }
 
     // --- relative_timestamp ---

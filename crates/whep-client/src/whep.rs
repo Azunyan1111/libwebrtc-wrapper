@@ -49,6 +49,8 @@ pub struct CallbackContext {
     pub audio_channels: AtomicU64,
     // Timestamp tracking
     pub first_video_timestamp_us: AtomicI64,
+    pub first_audio_capture_timestamp_ms: AtomicI64,
+    pub first_audio_anchor_timestamp_ms: AtomicI64,
     // Audio sample counter for precise timing
     pub audio_total_samples: AtomicU64,
     pub last_video_timestamp_ms: AtomicI64,
@@ -106,6 +108,8 @@ impl WhepClient {
             audio_sample_rate: AtomicU64::new(0),
             audio_channels: AtomicU64::new(0),
             first_video_timestamp_us: AtomicI64::new(-1),
+            first_audio_capture_timestamp_ms: AtomicI64::new(-1),
+            first_audio_anchor_timestamp_ms: AtomicI64::new(-1),
             audio_total_samples: AtomicU64::new(0),
             last_video_timestamp_ms: AtomicI64::new(-1),
             last_audio_timestamp_ms: AtomicI64::new(-1),
@@ -587,6 +591,8 @@ impl WhepClient {
         let sample_rate = frame.sample_rate as u32;
         let nb_channels = frame.num_channels as u32;
         let nb_frames = frame.samples_per_channel;
+        let callback_time_ms = frame.callback_time_ms;
+        let absolute_capture_timestamp_ms = frame.absolute_capture_timestamp_ms;
         let data = frame.data;
 
         let count = ctx.audio_frame_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -601,18 +607,58 @@ impl WhepClient {
             );
         }
 
-        // Calculate audio timestamp based on accumulated samples
+        // Track total samples for stats/debug.
         let prev_samples = ctx
             .audio_total_samples
             .fetch_add(nb_frames as u64, Ordering::Relaxed);
-        let timestamp_ms = (prev_samples as i64 * 1000) / sample_rate as i64;
+        let total_samples = prev_samples + nb_frames as u64;
+
+        // Prefer capture/callback clock for timestamping.
+        // This preserves timeline continuity even if some audio frames are dropped.
+        let capture_timestamp_ms = absolute_capture_timestamp_ms.or_else(|| {
+            if callback_time_ms > 0 {
+                Some(callback_time_ms)
+            } else {
+                None
+            }
+        });
+        let mut timestamp_ms = if let Some(capture_ms) = capture_timestamp_ms {
+            let first_capture = ctx.first_audio_capture_timestamp_ms.load(Ordering::Relaxed);
+            if first_capture < 0 {
+                ctx.first_audio_capture_timestamp_ms
+                    .store(capture_ms, Ordering::Relaxed);
+                let anchor = ctx.last_video_timestamp_ms.load(Ordering::Relaxed).max(0);
+                ctx.first_audio_anchor_timestamp_ms
+                    .store(anchor, Ordering::Relaxed);
+                anchor
+            } else {
+                let anchor = ctx.first_audio_anchor_timestamp_ms.load(Ordering::Relaxed).max(0);
+                anchor + (capture_ms - first_capture)
+            }
+        } else {
+            (prev_samples as i64 * 1000) / sample_rate as i64
+        };
+
+        // Keep monotonic order for muxers/decoders that reject timestamp regressions.
+        let last_audio_ts = ctx.last_audio_timestamp_ms.load(Ordering::Relaxed);
+        if last_audio_ts >= 0 && timestamp_ms < last_audio_ts {
+            timestamp_ms = last_audio_ts;
+        }
+
         ctx.last_audio_timestamp_ms
             .store(timestamp_ms, Ordering::Relaxed);
         if self.debug && count % 100 == 1 {
-            let total_samples = prev_samples + nb_frames as u64;
+            let source = if absolute_capture_timestamp_ms.is_some() {
+                "absolute_capture_timestamp_ms"
+            } else if callback_time_ms > 0 {
+                "callback_time_ms"
+            } else {
+                "sample_counter_fallback"
+            };
+            let read_ms = capture_timestamp_ms.unwrap_or(timestamp_ms);
             eprintln!(
-                "[DEBUG] Audio ts: read_ms={}, write_ms={}, total_samples={}",
-                timestamp_ms, timestamp_ms, total_samples
+                "[DEBUG] Audio ts: read_ms={}, write_ms={}, total_samples={}, source={}",
+                read_ms, timestamp_ms, total_samples, source
             );
         }
 
