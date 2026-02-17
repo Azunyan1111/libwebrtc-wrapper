@@ -3,6 +3,7 @@
 //! Supports:
 //! - V_UNCOMPRESSED (I420 YUV) video
 //! - A_PCM/INT/LIT (PCM S16LE) audio
+//! - A_OPUS audio
 //!
 //! Uses unknown-size encoding for Segment and Cluster to enable streaming output.
 
@@ -37,6 +38,8 @@ mod ebml_ids {
     pub const TRACK_TYPE: &[u8] = &[0x83];
     pub const CODEC_ID: &[u8] = &[0x86];
     pub const CODEC_PRIVATE: &[u8] = &[0x63, 0xA2];
+    pub const CODEC_DELAY: &[u8] = &[0x56, 0xAA];
+    pub const SEEK_PRE_ROLL: &[u8] = &[0x56, 0xBB];
 
     // Video track
     pub const VIDEO: &[u8] = &[0xE0];
@@ -77,6 +80,14 @@ pub struct MkvConfig {
     pub video_height: u32,
     pub audio_sample_rate: u32,
     pub audio_channels: u32,
+    pub audio_codec: AudioCodec,
+    pub opus_pre_skip: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioCodec {
+    PcmS16Le,
+    Opus,
 }
 
 /// MKV Writer for streaming output
@@ -118,17 +129,37 @@ impl<W: Write> MkvWriter<W> {
         // EBMLVersion = 1
         write_ebml_element(&mut header_data, ebml_ids::EBML_VERSION, &encode_uint(1))?;
         // EBMLReadVersion = 1
-        write_ebml_element(&mut header_data, ebml_ids::EBML_READ_VERSION, &encode_uint(1))?;
+        write_ebml_element(
+            &mut header_data,
+            ebml_ids::EBML_READ_VERSION,
+            &encode_uint(1),
+        )?;
         // EBMLMaxIDLength = 4
-        write_ebml_element(&mut header_data, ebml_ids::EBML_MAX_ID_LENGTH, &encode_uint(4))?;
+        write_ebml_element(
+            &mut header_data,
+            ebml_ids::EBML_MAX_ID_LENGTH,
+            &encode_uint(4),
+        )?;
         // EBMLMaxSizeLength = 8
-        write_ebml_element(&mut header_data, ebml_ids::EBML_MAX_SIZE_LENGTH, &encode_uint(8))?;
+        write_ebml_element(
+            &mut header_data,
+            ebml_ids::EBML_MAX_SIZE_LENGTH,
+            &encode_uint(8),
+        )?;
         // DocType = "matroska"
         write_ebml_element(&mut header_data, ebml_ids::DOC_TYPE, b"matroska")?;
         // DocTypeVersion = 4
-        write_ebml_element(&mut header_data, ebml_ids::DOC_TYPE_VERSION, &encode_uint(4))?;
+        write_ebml_element(
+            &mut header_data,
+            ebml_ids::DOC_TYPE_VERSION,
+            &encode_uint(4),
+        )?;
         // DocTypeReadVersion = 2
-        write_ebml_element(&mut header_data, ebml_ids::DOC_TYPE_READ_VERSION, &encode_uint(2))?;
+        write_ebml_element(
+            &mut header_data,
+            ebml_ids::DOC_TYPE_READ_VERSION,
+            &encode_uint(2),
+        )?;
 
         write_ebml_element(&mut self.writer, ebml_ids::EBML, &header_data)?;
         Ok(())
@@ -146,7 +177,11 @@ impl<W: Write> MkvWriter<W> {
         let mut info_data = Vec::new();
 
         // TimestampScale = 1,000,000 (1ms precision)
-        write_ebml_element(&mut info_data, ebml_ids::TIMESTAMP_SCALE, &encode_uint(1_000_000))?;
+        write_ebml_element(
+            &mut info_data,
+            ebml_ids::TIMESTAMP_SCALE,
+            &encode_uint(1_000_000),
+        )?;
         // MuxingApp
         write_ebml_element(&mut info_data, ebml_ids::MUXING_APP, b"whep-client")?;
         // WritingApp
@@ -177,11 +212,19 @@ impl<W: Write> MkvWriter<W> {
         let mut track = Vec::new();
 
         // TrackNumber = 1
-        write_ebml_element(&mut track, ebml_ids::TRACK_NUMBER, &encode_uint(VIDEO_TRACK_NUMBER as u64))?;
+        write_ebml_element(
+            &mut track,
+            ebml_ids::TRACK_NUMBER,
+            &encode_uint(VIDEO_TRACK_NUMBER as u64),
+        )?;
         // TrackUID = 1
         write_ebml_element(&mut track, ebml_ids::TRACK_UID, &encode_uint(1))?;
         // TrackType = 1 (video)
-        write_ebml_element(&mut track, ebml_ids::TRACK_TYPE, &encode_uint(TRACK_TYPE_VIDEO as u64))?;
+        write_ebml_element(
+            &mut track,
+            ebml_ids::TRACK_TYPE,
+            &encode_uint(TRACK_TYPE_VIDEO as u64),
+        )?;
         // CodecID = V_UNCOMPRESSED
         write_ebml_element(&mut track, ebml_ids::CODEC_ID, b"V_UNCOMPRESSED")?;
 
@@ -191,8 +234,16 @@ impl<W: Write> MkvWriter<W> {
 
         // Video element
         let mut video = Vec::new();
-        write_ebml_element(&mut video, ebml_ids::PIXEL_WIDTH, &encode_uint(self.config.video_width as u64))?;
-        write_ebml_element(&mut video, ebml_ids::PIXEL_HEIGHT, &encode_uint(self.config.video_height as u64))?;
+        write_ebml_element(
+            &mut video,
+            ebml_ids::PIXEL_WIDTH,
+            &encode_uint(self.config.video_width as u64),
+        )?;
+        write_ebml_element(
+            &mut video,
+            ebml_ids::PIXEL_HEIGHT,
+            &encode_uint(self.config.video_height as u64),
+        )?;
         // ColourSpace: I420 FourCC
         write_ebml_element(&mut video, ebml_ids::COLOUR_SPACE, &fourcc)?;
         write_ebml_element(&mut track, ebml_ids::VIDEO, &video)?;
@@ -205,21 +256,82 @@ impl<W: Write> MkvWriter<W> {
         let mut track = Vec::new();
 
         // TrackNumber = 2
-        write_ebml_element(&mut track, ebml_ids::TRACK_NUMBER, &encode_uint(AUDIO_TRACK_NUMBER as u64))?;
+        write_ebml_element(
+            &mut track,
+            ebml_ids::TRACK_NUMBER,
+            &encode_uint(AUDIO_TRACK_NUMBER as u64),
+        )?;
         // TrackUID = 2
         write_ebml_element(&mut track, ebml_ids::TRACK_UID, &encode_uint(2))?;
         // TrackType = 2 (audio)
-        write_ebml_element(&mut track, ebml_ids::TRACK_TYPE, &encode_uint(TRACK_TYPE_AUDIO as u64))?;
-        // CodecID = A_PCM/INT/LIT (signed integer, little-endian)
-        write_ebml_element(&mut track, ebml_ids::CODEC_ID, b"A_PCM/INT/LIT")?;
+        write_ebml_element(
+            &mut track,
+            ebml_ids::TRACK_TYPE,
+            &encode_uint(TRACK_TYPE_AUDIO as u64),
+        )?;
+        match self.config.audio_codec {
+            AudioCodec::PcmS16Le => {
+                // CodecID = A_PCM/INT/LIT (signed integer, little-endian)
+                write_ebml_element(&mut track, ebml_ids::CODEC_ID, b"A_PCM/INT/LIT")?;
 
-        // Audio element
-        let mut audio = Vec::new();
-        write_ebml_element(&mut audio, ebml_ids::SAMPLING_FREQUENCY, &encode_float64(self.config.audio_sample_rate as f64))?;
-        write_ebml_element(&mut audio, ebml_ids::CHANNELS, &encode_uint(self.config.audio_channels as u64))?;
-        // BitDepth = 16
-        write_ebml_element(&mut audio, ebml_ids::BIT_DEPTH, &encode_uint(16))?;
-        write_ebml_element(&mut track, ebml_ids::AUDIO, &audio)?;
+                // Audio element
+                let mut audio = Vec::new();
+                write_ebml_element(
+                    &mut audio,
+                    ebml_ids::SAMPLING_FREQUENCY,
+                    &encode_float64(self.config.audio_sample_rate as f64),
+                )?;
+                write_ebml_element(
+                    &mut audio,
+                    ebml_ids::CHANNELS,
+                    &encode_uint(self.config.audio_channels as u64),
+                )?;
+                // BitDepth = 16
+                write_ebml_element(&mut audio, ebml_ids::BIT_DEPTH, &encode_uint(16))?;
+                write_ebml_element(&mut track, ebml_ids::AUDIO, &audio)?;
+            }
+            AudioCodec::Opus => {
+                // CodecID = A_OPUS
+                write_ebml_element(&mut track, ebml_ids::CODEC_ID, b"A_OPUS")?;
+                write_ebml_element(
+                    &mut track,
+                    ebml_ids::CODEC_PRIVATE,
+                    &build_opus_head(
+                        self.config.audio_channels as u8,
+                        self.config.opus_pre_skip,
+                        self.config.audio_sample_rate,
+                    ),
+                )?;
+
+                // Opus-specific timing metadata (nanoseconds)
+                let codec_delay_ns = (self.config.opus_pre_skip as u64 * 1_000_000_000u64)
+                    / self.config.audio_sample_rate.max(1) as u64;
+                write_ebml_element(
+                    &mut track,
+                    ebml_ids::CODEC_DELAY,
+                    &encode_uint(codec_delay_ns),
+                )?;
+                // 80ms per Matroska Opus mapping recommendation
+                write_ebml_element(
+                    &mut track,
+                    ebml_ids::SEEK_PRE_ROLL,
+                    &encode_uint(80_000_000),
+                )?;
+
+                let mut audio = Vec::new();
+                write_ebml_element(
+                    &mut audio,
+                    ebml_ids::SAMPLING_FREQUENCY,
+                    &encode_float64(self.config.audio_sample_rate as f64),
+                )?;
+                write_ebml_element(
+                    &mut audio,
+                    ebml_ids::CHANNELS,
+                    &encode_uint(self.config.audio_channels as u64),
+                )?;
+                write_ebml_element(&mut track, ebml_ids::AUDIO, &audio)?;
+            }
+        }
 
         Ok(track)
     }
@@ -231,7 +343,11 @@ impl<W: Write> MkvWriter<W> {
         self.writer.write_all(UNKNOWN_SIZE)?;
 
         // Write Timestamp
-        write_ebml_element(&mut self.writer, ebml_ids::TIMESTAMP, &encode_uint(timestamp_ms as u64))?;
+        write_ebml_element(
+            &mut self.writer,
+            ebml_ids::TIMESTAMP,
+            &encode_uint(timestamp_ms as u64),
+        )?;
 
         self.cluster_start_time = Some(timestamp_ms);
         Ok(())
@@ -260,7 +376,12 @@ impl<W: Write> MkvWriter<W> {
 
     /// Write a video frame
     #[allow(dead_code)]
-    pub fn write_video_frame(&mut self, frame: &[u8], timestamp_ms: i64, is_keyframe: bool) -> Result<()> {
+    pub fn write_video_frame(
+        &mut self,
+        frame: &[u8],
+        timestamp_ms: i64,
+        is_keyframe: bool,
+    ) -> Result<()> {
         self.maybe_start_new_cluster(timestamp_ms, is_keyframe)?;
 
         let relative_ts = self.relative_timestamp(timestamp_ms);
@@ -324,7 +445,13 @@ impl<W: Write> MkvWriter<W> {
     }
 
     /// Write a SimpleBlock
-    fn write_simple_block(&mut self, track_number: u8, relative_ts: i16, is_keyframe: bool, data: &[u8]) -> Result<()> {
+    fn write_simple_block(
+        &mut self,
+        track_number: u8,
+        relative_ts: i16,
+        is_keyframe: bool,
+        data: &[u8],
+    ) -> Result<()> {
         // SimpleBlock structure:
         // [Track Number (VINT)] [Relative Timestamp (int16 BE)] [Flags] [Data]
         let track_vint = encode_vint_value(track_number as u64);
@@ -367,12 +494,15 @@ impl<W: Write> MkvWriter<W> {
         let uv_w = (w + 1) / 2;
         let uv_h = (h + 1) / 2;
 
-        let y_required = required_plane_size(y_stride, w, h)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "Y plane size overflow"))?;
-        let u_required = required_plane_size(u_stride, uv_w, uv_h)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "U plane size overflow"))?;
-        let v_required = required_plane_size(v_stride, uv_w, uv_h)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "V plane size overflow"))?;
+        let y_required = required_plane_size(y_stride, w, h).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "Y plane size overflow")
+        })?;
+        let u_required = required_plane_size(u_stride, uv_w, uv_h).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "U plane size overflow")
+        })?;
+        let v_required = required_plane_size(v_stride, uv_w, uv_h).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "V plane size overflow")
+        })?;
 
         if y_required > y_data.len() || u_required > u_data.len() || v_required > v_data.len() {
             return Err(std::io::Error::new(
@@ -383,8 +513,13 @@ impl<W: Write> MkvWriter<W> {
 
         let data_len = w
             .checked_mul(h)
-            .and_then(|y| uv_w.checked_mul(uv_h).and_then(|uv| y.checked_add(uv.checked_mul(2)?)))
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "I420 data length overflow"))?;
+            .and_then(|y| {
+                uv_w.checked_mul(uv_h)
+                    .and_then(|uv| y.checked_add(uv.checked_mul(2)?))
+            })
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "I420 data length overflow")
+            })?;
 
         let track_vint = encode_vint_value(track_number as u64);
         let header_len = track_vint.len() + 2 + 1;
@@ -441,11 +576,7 @@ fn encode_vint_value(value: u64) -> Vec<u8> {
     } else if value < 0x4000 {
         vec![0x40 | (value >> 8) as u8, value as u8]
     } else if value < 0x20_0000 {
-        vec![
-            0x20 | (value >> 16) as u8,
-            (value >> 8) as u8,
-            value as u8,
-        ]
+        vec![0x20 | (value >> 16) as u8, (value >> 8) as u8, value as u8]
     } else if value < 0x1000_0000 {
         vec![
             0x10 | (value >> 24) as u8,
@@ -519,6 +650,18 @@ fn required_plane_size(stride: usize, row_width: usize, rows: usize) -> Option<u
     }
     let last_row = rows.checked_sub(1)?;
     last_row.checked_mul(stride)?.checked_add(row_width)
+}
+
+fn build_opus_head(channels: u8, pre_skip: u16, input_sample_rate: u32) -> [u8; 19] {
+    let mut opus_head = [0u8; 19];
+    opus_head[0..8].copy_from_slice(b"OpusHead");
+    opus_head[8] = 1; // Version
+    opus_head[9] = channels;
+    opus_head[10..12].copy_from_slice(&pre_skip.to_le_bytes());
+    opus_head[12..16].copy_from_slice(&input_sample_rate.to_le_bytes());
+    opus_head[16..18].copy_from_slice(&0i16.to_le_bytes()); // Output gain
+    opus_head[18] = 0; // Channel mapping family
+    opus_head
 }
 
 #[cfg(test)]
@@ -597,6 +740,8 @@ mod tests {
             video_height: 1080,
             audio_sample_rate: 48000,
             audio_channels: 2,
+            audio_codec: AudioCodec::PcmS16Le,
+            opus_pre_skip: 0,
         };
         let writer = MkvWriter::new(buf, config).unwrap();
         let output = writer.writer;
@@ -617,6 +762,8 @@ mod tests {
             video_height: 2,
             audio_sample_rate: 48000,
             audio_channels: 2,
+            audio_codec: AudioCodec::PcmS16Le,
+            opus_pre_skip: 0,
         };
         let mut writer = MkvWriter::new(buf, config).unwrap();
         let header_len = writer.writer.len();
@@ -639,6 +786,8 @@ mod tests {
             video_height: 2,
             audio_sample_rate: 48000,
             audio_channels: 2,
+            audio_codec: AudioCodec::PcmS16Le,
+            opus_pre_skip: 0,
         };
         let mut writer = MkvWriter::new(buf, config).unwrap();
         let header_len = writer.writer.len();
@@ -659,6 +808,8 @@ mod tests {
             video_height: 2,
             audio_sample_rate: 48000,
             audio_channels: 2,
+            audio_codec: AudioCodec::PcmS16Le,
+            opus_pre_skip: 0,
         };
         let mut writer = MkvWriter::new(buf, config).unwrap();
 
@@ -683,6 +834,8 @@ mod tests {
             video_height: 2,
             audio_sample_rate: 48000,
             audio_channels: 2,
+            audio_codec: AudioCodec::PcmS16Le,
+            opus_pre_skip: 0,
         };
         let mut writer = MkvWriter::new(buf, config).unwrap();
 
@@ -704,6 +857,8 @@ mod tests {
             video_height: 2,
             audio_sample_rate: 48000,
             audio_channels: 2,
+            audio_codec: AudioCodec::PcmS16Le,
+            opus_pre_skip: 0,
         };
         let mut writer = MkvWriter::new(buf, config).unwrap();
         writer.cluster_start_time = Some(1000);
@@ -721,6 +876,8 @@ mod tests {
             video_height: 2,
             audio_sample_rate: 48000,
             audio_channels: 2,
+            audio_codec: AudioCodec::PcmS16Le,
+            opus_pre_skip: 0,
         };
         let mut writer = MkvWriter::new(buf, config).unwrap();
         writer.cluster_start_time = Some(0);
@@ -744,6 +901,8 @@ mod tests {
             video_height: 1080,
             audio_sample_rate: 48000,
             audio_channels: 2,
+            audio_codec: AudioCodec::PcmS16Le,
+            opus_pre_skip: 0,
         };
         let writer = MkvWriter::new(buf, config).unwrap();
         let track_data = writer.build_video_track().unwrap();
@@ -751,9 +910,7 @@ mod tests {
         // V_UNCOMPRESSEDコーデックIDが含まれていること
         let codec_id = b"V_UNCOMPRESSED";
         assert!(
-            track_data
-                .windows(codec_id.len())
-                .any(|w| w == codec_id),
+            track_data.windows(codec_id.len()).any(|w| w == codec_id),
             "V_UNCOMPRESSED codec ID not found in video track"
         );
     }
@@ -768,6 +925,8 @@ mod tests {
             video_height: 1080,
             audio_sample_rate: 48000,
             audio_channels: 2,
+            audio_codec: AudioCodec::PcmS16Le,
+            opus_pre_skip: 0,
         };
         let writer = MkvWriter::new(buf, config).unwrap();
         let track_data = writer.build_audio_track().unwrap();
@@ -775,10 +934,35 @@ mod tests {
         // A_PCM/INT/LITコーデックIDが含まれていること
         let codec_id = b"A_PCM/INT/LIT";
         assert!(
-            track_data
-                .windows(codec_id.len())
-                .any(|w| w == codec_id),
+            track_data.windows(codec_id.len()).any(|w| w == codec_id),
             "A_PCM/INT/LIT codec ID not found in audio track"
+        );
+    }
+
+    #[test]
+    fn test_build_audio_track_opus() {
+        let buf = Vec::new();
+        let config = MkvConfig {
+            video_width: 1920,
+            video_height: 1080,
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+            audio_codec: AudioCodec::Opus,
+            opus_pre_skip: 312,
+        };
+        let writer = MkvWriter::new(buf, config).unwrap();
+        let track_data = writer.build_audio_track().unwrap();
+
+        let codec_id = b"A_OPUS";
+        assert!(
+            track_data.windows(codec_id.len()).any(|w| w == codec_id),
+            "A_OPUS codec ID not found in audio track"
+        );
+
+        let opus_head = b"OpusHead";
+        assert!(
+            track_data.windows(opus_head.len()).any(|w| w == opus_head),
+            "OpusHead codec private not found in audio track"
         );
     }
 }

@@ -38,8 +38,12 @@ pub enum MkvFrame {
 impl MkvFrame {
     pub fn payload(&self) -> &[u8] {
         match self {
-            MkvFrame::Video { data, data_offset, .. } => &data[*data_offset..],
-            MkvFrame::Audio { data, data_offset, .. } => &data[*data_offset..],
+            MkvFrame::Video {
+                data, data_offset, ..
+            } => &data[*data_offset..],
+            MkvFrame::Audio {
+                data, data_offset, ..
+            } => &data[*data_offset..],
         }
     }
 }

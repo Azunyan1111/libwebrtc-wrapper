@@ -4,14 +4,12 @@
 
 use crate::mkv_reader::{MkvFrame, MkvReader};
 use anyhow::{anyhow, Result};
+use cxx::SharedPtr;
 use libwebrtc::audio_frame::AudioFrame;
 use libwebrtc::audio_source::native::NativeAudioSource;
 use libwebrtc::audio_source::AudioSourceOptions;
 use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
 use libwebrtc::prelude::*;
-use cxx::SharedPtr;
-use webrtc_sys::rtp_parameters as sys_rp;
-use webrtc_sys::rtp_sender as sys_rs;
 use libwebrtc::video_frame::{I420Buffer, VideoFrame, VideoRotation};
 use libwebrtc::video_source::native::NativeVideoSource;
 use libwebrtc::video_source::VideoResolution;
@@ -26,6 +24,8 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use url::Url;
+use webrtc_sys::rtp_parameters as sys_rp;
+use webrtc_sys::rtp_sender as sys_rs;
 
 const AUDIO_QUEUE_SIZE_MS: u32 = 100;
 const LATE_DROP_THRESHOLD_MS: i64 = 150;
@@ -410,8 +410,7 @@ impl WhipClient {
                     ..
                 } = &frame
                 {
-                    let (wall_start, pts_start_ms) =
-                        ensure_pacing_base(&video_ctx, *timestamp_ms);
+                    let (wall_start, pts_start_ms) = ensure_pacing_base(&video_ctx, *timestamp_ms);
                     let elapsed_ms = wall_start.elapsed().as_millis() as i64;
                     let target_ms = *timestamp_ms - pts_start_ms;
                     let wait_ms = target_ms - elapsed_ms;
@@ -420,7 +419,8 @@ impl WhipClient {
                         .last_video_drift_ms
                         .store(drift_ms, Ordering::Relaxed);
                     if wait_ms > 0 {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms as u64)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms as u64))
+                            .await;
                     }
 
                     let payload = frame.payload();
@@ -617,50 +617,46 @@ impl WhipClient {
 
             // Read next frame from MKV
             match reader.read_frame() {
-                Ok(Some(frame)) => {
-                    match &frame {
-                        MkvFrame::Video { .. } => {
-                            if video_tx.send(frame).is_err() {
-                                break Err(anyhow!("Video task terminated unexpectedly"));
-                            }
-                            let new_backlog =
-                                ctx.video_queue_backlog.fetch_add(1, Ordering::Relaxed) + 1;
-                            let mut current_max =
-                                ctx.video_queue_backlog_max.load(Ordering::Relaxed);
-                            while new_backlog > current_max {
-                                match ctx.video_queue_backlog_max.compare_exchange(
-                                    current_max,
-                                    new_backlog,
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                ) {
-                                    Ok(_) => break,
-                                    Err(actual) => current_max = actual,
-                                }
-                            }
+                Ok(Some(frame)) => match &frame {
+                    MkvFrame::Video { .. } => {
+                        if video_tx.send(frame).is_err() {
+                            break Err(anyhow!("Video task terminated unexpectedly"));
                         }
-                        MkvFrame::Audio { .. } => {
-                            if audio_tx.send(frame).is_err() {
-                                break Err(anyhow!("Audio task terminated unexpectedly"));
-                            }
-                            let new_backlog =
-                                ctx.audio_queue_backlog.fetch_add(1, Ordering::Relaxed) + 1;
-                            let mut current_max =
-                                ctx.audio_queue_backlog_max.load(Ordering::Relaxed);
-                            while new_backlog > current_max {
-                                match ctx.audio_queue_backlog_max.compare_exchange(
-                                    current_max,
-                                    new_backlog,
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed,
-                                ) {
-                                    Ok(_) => break,
-                                    Err(actual) => current_max = actual,
-                                }
+                        let new_backlog =
+                            ctx.video_queue_backlog.fetch_add(1, Ordering::Relaxed) + 1;
+                        let mut current_max = ctx.video_queue_backlog_max.load(Ordering::Relaxed);
+                        while new_backlog > current_max {
+                            match ctx.video_queue_backlog_max.compare_exchange(
+                                current_max,
+                                new_backlog,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => break,
+                                Err(actual) => current_max = actual,
                             }
                         }
                     }
-                }
+                    MkvFrame::Audio { .. } => {
+                        if audio_tx.send(frame).is_err() {
+                            break Err(anyhow!("Audio task terminated unexpectedly"));
+                        }
+                        let new_backlog =
+                            ctx.audio_queue_backlog.fetch_add(1, Ordering::Relaxed) + 1;
+                        let mut current_max = ctx.audio_queue_backlog_max.load(Ordering::Relaxed);
+                        while new_backlog > current_max {
+                            match ctx.audio_queue_backlog_max.compare_exchange(
+                                current_max,
+                                new_backlog,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => break,
+                                Err(actual) => current_max = actual,
+                            }
+                        }
+                    }
+                },
                 Ok(None) => {
                     // EOF reached
                     info!("End of MKV stream");
@@ -684,10 +680,8 @@ impl WhipClient {
                 let audio_count = ctx.audio_frame_count.load(Ordering::Relaxed);
                 let last_video_ts = ctx.last_video_timestamp_ms.load(Ordering::Relaxed);
                 let last_audio_ts = ctx.last_audio_timestamp_ms.load(Ordering::Relaxed);
-                let last_audio_mkv_ts =
-                    ctx.last_audio_mkv_timestamp_ms.load(Ordering::Relaxed);
-                let first_audio_mkv_ts =
-                    ctx.first_audio_mkv_timestamp_ms.load(Ordering::Relaxed);
+                let last_audio_mkv_ts = ctx.last_audio_mkv_timestamp_ms.load(Ordering::Relaxed);
+                let first_audio_mkv_ts = ctx.first_audio_mkv_timestamp_ms.load(Ordering::Relaxed);
                 let first_audio_ts = ctx.first_audio_timestamp_ms.load(Ordering::Relaxed);
                 let audio_total_samples = ctx.audio_total_samples.load(Ordering::Relaxed);
                 let last_video_drift_ms = ctx.last_video_drift_ms.load(Ordering::Relaxed);
@@ -701,10 +695,8 @@ impl WhipClient {
                     ctx.audio_capture_wait_max_ms.load(Ordering::Relaxed);
                 let video_queue_backlog = ctx.video_queue_backlog.load(Ordering::Relaxed);
                 let audio_queue_backlog = ctx.audio_queue_backlog.load(Ordering::Relaxed);
-                let video_queue_backlog_max =
-                    ctx.video_queue_backlog_max.load(Ordering::Relaxed);
-                let audio_queue_backlog_max =
-                    ctx.audio_queue_backlog_max.load(Ordering::Relaxed);
+                let video_queue_backlog_max = ctx.video_queue_backlog_max.load(Ordering::Relaxed);
+                let audio_queue_backlog_max = ctx.audio_queue_backlog_max.load(Ordering::Relaxed);
                 let audio_capture_wait_avg_ms = if audio_capture_wait_count > 0 {
                     (audio_capture_wait_total_ms / audio_capture_wait_count) as i64
                 } else {
@@ -715,9 +707,8 @@ impl WhipClient {
                 } else {
                     -1
                 };
-                let mkv_audio_elapsed_ms =
-                    if last_audio_mkv_ts >= 0 && first_audio_mkv_ts >= 0 {
-                        last_audio_mkv_ts - first_audio_mkv_ts
+                let mkv_audio_elapsed_ms = if last_audio_mkv_ts >= 0 && first_audio_mkv_ts >= 0 {
+                    last_audio_mkv_ts - first_audio_mkv_ts
                 } else {
                     -1
                 };
@@ -776,8 +767,12 @@ impl WhipClient {
         // シャットダウン: チャネルdropでタスクにEOF通知
         drop(video_tx);
         drop(audio_tx);
-        let video_result = video_task.await.map_err(|e| anyhow!("Video task panicked: {}", e))?;
-        let audio_result = audio_task.await.map_err(|e| anyhow!("Audio task panicked: {}", e))?;
+        let video_result = video_task
+            .await
+            .map_err(|e| anyhow!("Video task panicked: {}", e))?;
+        let audio_result = audio_task
+            .await
+            .map_err(|e| anyhow!("Audio task panicked: {}", e))?;
         dispatch_result?;
         video_result?;
         audio_result?;
@@ -813,11 +808,7 @@ impl WhipClient {
     }
 
     /// Send a single ICE candidate to the WHIP resource URL via PATCH
-    async fn send_ice_candidate(
-        &self,
-        resource_url: &str,
-        candidate: &IceCandidate,
-    ) -> Result<()> {
+    async fn send_ice_candidate(&self, resource_url: &str, candidate: &IceCandidate) -> Result<()> {
         // Format as SDP fragment per RFC 8840 / draft-ietf-wish-whip
         let candidate_str = candidate.to_string();
         let sdp_mid = candidate.sdp_mid();
@@ -1201,7 +1192,8 @@ fn feed_video_frame(
 
         // Copy V plane
         let v_copy_len = v_data.len().min(uv_size);
-        v_data[..v_copy_len].copy_from_slice(&data[y_size + uv_size..y_size + uv_size + v_copy_len]);
+        v_data[..v_copy_len]
+            .copy_from_slice(&data[y_size + uv_size..y_size + uv_size + v_copy_len]);
     }
 
     // Calculate timestamp in microseconds relative to first frame
@@ -1246,8 +1238,7 @@ async fn feed_audio_frame(
         }
         eprintln!(
             "[INFO] First audio frame: ts={}ms mkv_ts={}ms",
-            audio_clock_ms,
-            mkv_timestamp_ms
+            audio_clock_ms, mkv_timestamp_ms
         );
     }
 
@@ -1285,12 +1276,9 @@ async fn feed_audio_frame(
     let capture_wait_ms = capture_start.elapsed().as_millis() as i64;
     ctx.last_audio_capture_wait_ms
         .store(capture_wait_ms, Ordering::Relaxed);
-    ctx.audio_capture_wait_total_ms.fetch_add(
-        capture_wait_ms.max(0) as u64,
-        Ordering::Relaxed,
-    );
-    ctx.audio_capture_wait_count
-        .fetch_add(1, Ordering::Relaxed);
+    ctx.audio_capture_wait_total_ms
+        .fetch_add(capture_wait_ms.max(0) as u64, Ordering::Relaxed);
+    ctx.audio_capture_wait_count.fetch_add(1, Ordering::Relaxed);
     let mut current_max = ctx.audio_capture_wait_max_ms.load(Ordering::Relaxed);
     while capture_wait_ms > current_max {
         match ctx.audio_capture_wait_max_ms.compare_exchange(
@@ -1365,7 +1353,8 @@ mod tests {
 
     #[test]
     fn test_parse_ice_server_entry_turn() {
-        let entry = r#"<turn:turn.example.com:3478>; rel="ice-server"; username="user"; credential="pass""#;
+        let entry =
+            r#"<turn:turn.example.com:3478>; rel="ice-server"; username="user"; credential="pass""#;
         let server = parse_ice_server_entry(entry);
         assert!(server.is_some());
         let server = server.unwrap();

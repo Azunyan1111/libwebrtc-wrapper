@@ -1,9 +1,11 @@
 //! WHEP (WebRTC-HTTP Egress Protocol) client implementation
 
-use crate::mkv_writer::{MkvConfig, MkvWriter};
+use crate::mkv_writer::{AudioCodec, MkvConfig, MkvWriter};
 use anyhow::{anyhow, Result};
 use futures::stream::StreamExt;
 use libwebrtc::audio_stream::native::NativeAudioStream;
+use libwebrtc::encoded_audio_stream::native::NativeEncodedAudioStream;
+use libwebrtc::encoded_audio_stream::EncodedAudioFrame;
 use libwebrtc::prelude::*;
 use libwebrtc::video_stream::native::NativeVideoStream;
 use parking_lot::Mutex as ParkingMutex;
@@ -16,6 +18,19 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use url::Url;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioOutputMode {
+    PcmS16Le,
+    OpusPassthrough,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OpusSdpInfo {
+    payload_type: u8,
+    sample_rate: u32,
+    channels: u32,
+}
+
 /// WHEP Client for receiving WebRTC streams
 pub struct WhepClient {
     whep_url: String,
@@ -27,9 +42,12 @@ pub struct WhepClient {
     ice_candidate_rx: Option<mpsc::UnboundedReceiver<IceCandidate>>,
     end_of_candidates_sent: bool,
     debug: bool,
+    audio_output_mode: AudioOutputMode,
+    opus_sdp_info: Option<OpusSdpInfo>,
     // Video/Audio streams
     video_stream: Option<NativeVideoStream>,
     audio_stream: Option<NativeAudioStream>,
+    encoded_audio_stream: Option<NativeEncodedAudioStream>,
 }
 
 /// Context for frame counting, statistics, and MKV output.
@@ -51,6 +69,7 @@ pub struct CallbackContext {
     pub first_video_timestamp_us: AtomicI64,
     pub first_audio_capture_timestamp_ms: AtomicI64,
     pub first_audio_anchor_timestamp_ms: AtomicI64,
+    pub first_audio_rtp_timestamp: AtomicI64,
     // Audio sample counter for precise timing
     pub audio_total_samples: AtomicU64,
     pub last_video_timestamp_ms: AtomicI64,
@@ -59,7 +78,7 @@ pub struct CallbackContext {
 
 impl WhepClient {
     /// Create a new WHEP client
-    pub fn new(whep_url: &str, debug: bool) -> Result<Self> {
+    pub fn new(whep_url: &str, debug: bool, audio_output_mode: AudioOutputMode) -> Result<Self> {
         let http_client = reqwest::Client::builder().build()?;
 
         Ok(Self {
@@ -72,8 +91,11 @@ impl WhepClient {
             ice_candidate_rx: None,
             end_of_candidates_sent: false,
             debug,
+            audio_output_mode,
+            opus_sdp_info: None,
             video_stream: None,
             audio_stream: None,
+            encoded_audio_stream: None,
         })
     }
 
@@ -110,6 +132,7 @@ impl WhepClient {
             first_video_timestamp_us: AtomicI64::new(-1),
             first_audio_capture_timestamp_ms: AtomicI64::new(-1),
             first_audio_anchor_timestamp_ms: AtomicI64::new(-1),
+            first_audio_rtp_timestamp: AtomicI64::new(-1),
             audio_total_samples: AtomicU64::new(0),
             last_video_timestamp_ms: AtomicI64::new(-1),
             last_audio_timestamp_ms: AtomicI64::new(-1),
@@ -169,6 +192,7 @@ impl WhepClient {
             resource_url,
             ice_servers,
         } = response;
+        let opus_sdp_info = parse_opus_sdp_info(&sdp);
 
         if let Some(ref pc) = self.peer_connection {
             if ice_servers.is_empty() {
@@ -198,6 +222,20 @@ impl WhepClient {
 
         if let Some(ref url) = self.resource_url {
             info!("Resource URL: {}", url);
+        }
+
+        self.opus_sdp_info = opus_sdp_info;
+        if self.audio_output_mode == AudioOutputMode::OpusPassthrough {
+            if let Some(info) = self.opus_sdp_info {
+                info!(
+                    "Opus passthrough enabled: payload_type={} sample_rate={} channels={}",
+                    info.payload_type, info.sample_rate, info.channels
+                );
+            } else {
+                warn!(
+                    "Opus passthrough enabled but Opus rtpmap was not found in SDP, using defaults"
+                );
+            }
         }
 
         Ok(())
@@ -315,11 +353,18 @@ impl WhepClient {
                             info!("Setting up video stream...");
                             self.video_stream = Some(NativeVideoStream::new(video_track));
                         }
-                        MediaStreamTrack::Audio(audio_track) => {
-                            info!("Setting up audio stream (48kHz, 2ch)...");
-                            self.audio_stream =
-                                Some(NativeAudioStream::new(audio_track, 48000, 2));
-                        }
+                        MediaStreamTrack::Audio(audio_track) => match self.audio_output_mode {
+                            AudioOutputMode::PcmS16Le => {
+                                info!("Setting up audio stream (48kHz, 2ch PCM)...");
+                                self.audio_stream =
+                                    Some(NativeAudioStream::new(audio_track, 48000, 2));
+                            }
+                            AudioOutputMode::OpusPassthrough => {
+                                info!("Setting up encoded audio stream (Opus passthrough)...");
+                                self.encoded_audio_stream =
+                                    Some(NativeEncodedAudioStream::new(receiver.clone()));
+                            }
+                        },
                     }
                 }
             }
@@ -341,6 +386,7 @@ impl WhepClient {
 
         let mut video_stream = self.video_stream.take();
         let mut audio_stream = self.audio_stream.take();
+        let mut encoded_audio_stream = self.encoded_audio_stream.take();
 
         let mut last_debug_log = Instant::now();
         let mut last_video_count = 0u64;
@@ -351,7 +397,7 @@ impl WhepClient {
 
         loop {
             // Check if both streams have ended
-            if video_stream.is_none() && audio_stream.is_none() {
+            if video_stream.is_none() && audio_stream.is_none() && encoded_audio_stream.is_none() {
                 info!("Both video and audio streams have ended");
                 break;
             }
@@ -459,6 +505,28 @@ impl WhepClient {
                     }
                 }
 
+                // Process encoded audio frame (Opus passthrough)
+                encoded_audio_frame = async {
+                    if let Some(ref mut stream) = encoded_audio_stream {
+                        stream.next().await
+                    } else {
+                        futures::future::pending().await
+                    }
+                } => {
+                    match encoded_audio_frame {
+                        Some(frame) => {
+                            if let Err(e) = self.handle_encoded_audio_frame(&ctx, frame) {
+                                warn!("Encoded audio frame write error, stopping: {}", e);
+                                break;
+                            }
+                        }
+                        None => {
+                            info!("Encoded audio stream ended");
+                            encoded_audio_stream = None;
+                        }
+                    }
+                }
+
                 // Video stall detection: break if no video frame for video_stall_timeout
                 _ = async {
                     if let Some(last_time) = last_video_frame_time {
@@ -486,6 +554,7 @@ impl WhepClient {
         // Restore streams for cleanup
         self.video_stream = video_stream;
         self.audio_stream = audio_stream;
+        self.encoded_audio_stream = encoded_audio_stream;
 
         Ok(())
     }
@@ -514,11 +583,25 @@ impl WhepClient {
             );
 
             // Initialize MKV writer (video frame must arrive before audio can be written)
+            let (audio_codec, audio_sample_rate, audio_channels, opus_pre_skip) =
+                match self.audio_output_mode {
+                    AudioOutputMode::PcmS16Le => (AudioCodec::PcmS16Le, 48000, 2, 0u16),
+                    AudioOutputMode::OpusPassthrough => {
+                        let info = self.opus_sdp_info.unwrap_or(OpusSdpInfo {
+                            payload_type: 111,
+                            sample_rate: 48000,
+                            channels: 2,
+                        });
+                        (AudioCodec::Opus, info.sample_rate, info.channels, 0u16)
+                    }
+                };
             let config = MkvConfig {
                 video_width: width,
                 video_height: height,
-                audio_sample_rate: 48000,
-                audio_channels: 2,
+                audio_sample_rate,
+                audio_channels,
+                audio_codec,
+                opus_pre_skip,
             };
             let mut guard = ctx.mkv_writer.lock();
             match MkvWriter::new(BufWriter::new(std::io::stdout()), config) {
@@ -582,7 +665,11 @@ impl WhepClient {
     }
 
     /// Handle an audio frame
-    fn handle_audio_frame(&self, ctx: &Arc<CallbackContext>, frame: AudioFrame<'static>) -> Result<()> {
+    fn handle_audio_frame(
+        &self,
+        ctx: &Arc<CallbackContext>,
+        frame: AudioFrame<'static>,
+    ) -> Result<()> {
         // Check if MKV writer is initialized (waits for first video frame)
         if !ctx.mkv_writer_initialized.load(Ordering::Relaxed) {
             return Ok(());
@@ -599,8 +686,10 @@ impl WhepClient {
 
         // Store metadata on first audio frame (after MKV writer is initialized)
         if count == 1 {
-            ctx.audio_sample_rate.store(sample_rate as u64, Ordering::Relaxed);
-            ctx.audio_channels.store(nb_channels as u64, Ordering::Relaxed);
+            ctx.audio_sample_rate
+                .store(sample_rate as u64, Ordering::Relaxed);
+            ctx.audio_channels
+                .store(nb_channels as u64, Ordering::Relaxed);
             eprintln!(
                 "[INFO] Audio format detected: {}Hz {}ch ({} samples/channel)",
                 sample_rate, nb_channels, nb_frames
@@ -632,7 +721,10 @@ impl WhepClient {
                     .store(anchor, Ordering::Relaxed);
                 anchor
             } else {
-                let anchor = ctx.first_audio_anchor_timestamp_ms.load(Ordering::Relaxed).max(0);
+                let anchor = ctx
+                    .first_audio_anchor_timestamp_ms
+                    .load(Ordering::Relaxed)
+                    .max(0);
                 anchor + (capture_ms - first_capture)
             }
         } else {
@@ -688,6 +780,100 @@ impl WhepClient {
         Ok(())
     }
 
+    /// Handle an encoded audio frame (Opus passthrough mode)
+    fn handle_encoded_audio_frame(
+        &self,
+        ctx: &Arc<CallbackContext>,
+        frame: EncodedAudioFrame,
+    ) -> Result<()> {
+        if !ctx.mkv_writer_initialized.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let count = ctx.audio_frame_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let opus_sdp_info = self.opus_sdp_info.unwrap_or(OpusSdpInfo {
+            payload_type: 111,
+            sample_rate: 48000,
+            channels: 2,
+        });
+
+        if count == 1 {
+            ctx.audio_sample_rate
+                .store(opus_sdp_info.sample_rate as u64, Ordering::Relaxed);
+            ctx.audio_channels
+                .store(opus_sdp_info.channels as u64, Ordering::Relaxed);
+            eprintln!(
+                "[INFO] Encoded audio format detected: mime={} pt={} {}Hz {}ch",
+                frame.mime_type,
+                frame.payload_type,
+                opus_sdp_info.sample_rate,
+                opus_sdp_info.channels
+            );
+        }
+
+        if !frame.mime_type.eq_ignore_ascii_case("audio/opus") {
+            return Err(anyhow!(
+                "Opus passthrough mode received unsupported mime type: {}",
+                frame.mime_type
+            ));
+        }
+
+        let first_rtp = ctx.first_audio_rtp_timestamp.load(Ordering::Relaxed);
+        let anchor = ctx.first_audio_anchor_timestamp_ms.load(Ordering::Relaxed);
+        let mut timestamp_ms = if first_rtp < 0 {
+            let first = frame.rtp_timestamp as i64;
+            ctx.first_audio_rtp_timestamp
+                .store(first, Ordering::Relaxed);
+            let anchor = ctx.last_video_timestamp_ms.load(Ordering::Relaxed).max(0);
+            ctx.first_audio_anchor_timestamp_ms
+                .store(anchor, Ordering::Relaxed);
+            anchor
+        } else {
+            let rtp_delta = frame.rtp_timestamp.wrapping_sub(first_rtp as u32) as u64;
+            let anchor = anchor.max(0);
+            anchor + ((rtp_delta * 1000) / opus_sdp_info.sample_rate.max(1) as u64) as i64
+        };
+
+        let last_audio_ts = ctx.last_audio_timestamp_ms.load(Ordering::Relaxed);
+        if last_audio_ts >= 0 && timestamp_ms < last_audio_ts {
+            timestamp_ms = last_audio_ts;
+        }
+        ctx.last_audio_timestamp_ms
+            .store(timestamp_ms, Ordering::Relaxed);
+
+        if self.debug && count % 100 == 1 {
+            eprintln!(
+                "[DEBUG] Encoded audio ts: rtp_ts={}, write_ms={}, payload_type={}, size={}B",
+                frame.rtp_timestamp,
+                timestamp_ms,
+                frame.payload_type,
+                frame.data.len()
+            );
+        }
+
+        {
+            let mut guard = ctx.mkv_writer.lock();
+            if let Some(ref mut writer) = *guard {
+                if let Err(e) = writer.write_audio_frame(&frame.data, timestamp_ms) {
+                    eprintln!("[ERROR] Failed to write encoded audio frame: {}", e);
+                    return Err(anyhow!("Failed to write encoded audio frame: {}", e));
+                }
+            }
+        }
+
+        if count % 100 == 1 {
+            eprintln!(
+                "[TRACE] Encoded audio frame #{}: pt={} size={} ts={}ms",
+                count,
+                frame.payload_type,
+                frame.data.len(),
+                timestamp_ms
+            );
+        }
+
+        Ok(())
+    }
+
     /// Process pending ICE candidates and send them via PATCH (trickle ICE)
     async fn process_ice_candidates(&mut self) {
         let mut candidates = Vec::new();
@@ -717,11 +903,7 @@ impl WhepClient {
     }
 
     /// Send a single ICE candidate to the WHEP resource URL via PATCH
-    async fn send_ice_candidate(
-        &self,
-        resource_url: &str,
-        candidate: &IceCandidate,
-    ) -> Result<()> {
+    async fn send_ice_candidate(&self, resource_url: &str, candidate: &IceCandidate) -> Result<()> {
         // Format as SDP fragment per RFC 8840 / draft-ietf-wish-whip
         let candidate_str = candidate.to_string();
         let sdp_mid = candidate.sdp_mid();
@@ -882,7 +1064,12 @@ impl WhepClient {
 
             eprintln!(
                 "[INFO] Capture complete: {} video frames ({}x{}), {} audio frames ({}Hz {}ch)",
-                video_frames, video_width, video_height, audio_frames, audio_sample_rate, audio_channels
+                video_frames,
+                video_width,
+                video_height,
+                audio_frames,
+                audio_sample_rate,
+                audio_channels
             );
 
             // Flush MKV writer
@@ -897,6 +1084,9 @@ impl WhepClient {
             stream.close();
         }
         if let Some(mut stream) = self.audio_stream.take() {
+            stream.close();
+        }
+        if let Some(mut stream) = self.encoded_audio_stream.take() {
             stream.close();
         }
 
@@ -920,6 +1110,41 @@ struct WhepResponse {
     sdp: String,
     resource_url: Option<String>,
     ice_servers: Vec<IceServer>,
+}
+
+fn parse_opus_sdp_info(sdp: &str) -> Option<OpusSdpInfo> {
+    for line in sdp.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("a=rtpmap:") else {
+            continue;
+        };
+
+        let mut parts = rest.split_whitespace();
+        let payload_type = parts.next()?.parse::<u8>().ok()?;
+        let codec = parts.next()?;
+        let mut codec_parts = codec.split('/');
+        let codec_name = codec_parts.next()?.to_ascii_lowercase();
+        if codec_name != "opus" {
+            continue;
+        }
+
+        let sample_rate = codec_parts
+            .next()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(48000);
+        let channels = codec_parts
+            .next()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(2);
+
+        return Some(OpusSdpInfo {
+            payload_type,
+            sample_rate,
+            channels,
+        });
+    }
+
+    None
 }
 
 fn parse_ice_servers_from_headers(headers: &HeaderMap) -> Vec<IceServer> {
@@ -1050,7 +1275,10 @@ mod tests {
         let value = r#"<stun:stun.l.google.com:19302>; rel="ice-server""#;
         let entries = split_link_header_value(value);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0], r#"<stun:stun.l.google.com:19302>; rel="ice-server""#);
+        assert_eq!(
+            entries[0],
+            r#"<stun:stun.l.google.com:19302>; rel="ice-server""#
+        );
     }
 
     #[test]
@@ -1098,7 +1326,27 @@ mod tests {
     #[test]
     fn test_parse_param_value_whitespace() {
         assert_eq!(parse_param_value("  value  "), Some("value".to_string()));
-        assert_eq!(parse_param_value("  \"quoted\"  "), Some("quoted".to_string()));
+        assert_eq!(
+            parse_param_value("  \"quoted\"  "),
+            Some("quoted".to_string())
+        );
+    }
+
+    // --- parse_opus_sdp_info ---
+
+    #[test]
+    fn test_parse_opus_sdp_info_found() {
+        let sdp = "v=0\r\na=rtpmap:111 opus/48000/2\r\n";
+        let info = parse_opus_sdp_info(sdp).unwrap();
+        assert_eq!(info.payload_type, 111);
+        assert_eq!(info.sample_rate, 48000);
+        assert_eq!(info.channels, 2);
+    }
+
+    #[test]
+    fn test_parse_opus_sdp_info_not_found() {
+        let sdp = "v=0\r\na=rtpmap:96 VP8/90000\r\n";
+        assert!(parse_opus_sdp_info(sdp).is_none());
     }
 
     // --- parse_ice_server_entry ---
@@ -1116,7 +1364,8 @@ mod tests {
 
     #[test]
     fn test_parse_ice_server_entry_turn_with_credentials() {
-        let entry = r#"<turn:turn.example.com:3478>; rel="ice-server"; username="user"; credential="pass""#;
+        let entry =
+            r#"<turn:turn.example.com:3478>; rel="ice-server"; username="user"; credential="pass""#;
         let server = parse_ice_server_entry(entry);
         assert!(server.is_some());
         let server = server.unwrap();
