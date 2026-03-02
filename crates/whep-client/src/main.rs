@@ -9,7 +9,6 @@
 //!
 //! Video codec: V_UNCOMPRESSED (I420 YUV)
 //! Audio codec: A_PCM/INT/LIT (PCM S16LE)
-//!   with --audio-opus-passthrough: A_OPUS
 
 mod mkv_writer;
 mod whep;
@@ -20,7 +19,6 @@ struct AppConfig {
     whep_url: String,
     debug: bool,
     debug_libwebrtc: bool,
-    audio_opus_passthrough: bool,
 }
 
 /// Parse command line arguments
@@ -33,7 +31,6 @@ fn parse_args() -> AppConfig {
     let mut whep_url = default_url;
     let mut debug = false;
     let mut debug_libwebrtc = false;
-    let mut audio_opus_passthrough = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -48,29 +45,20 @@ fn parse_args() -> AppConfig {
                 eprintln!("  -h, --help          Show this help message");
                 eprintln!("  -d, --debug         Enable debug logging (this project)");
                 eprintln!("  -dlibwebrtc         Enable libwebrtc debug logging");
-                eprintln!("  --audio-opus-passthrough  Write received Opus directly to MKV (no decode/re-encode)");
                 eprintln!();
                 eprintln!("Output: MKV (Matroska) format to stdout");
                 eprintln!("  Video: V_UNCOMPRESSED (I420 YUV)");
                 eprintln!("  Audio: A_PCM/INT/LIT (PCM S16LE, 48kHz, stereo)");
-                eprintln!("         A_OPUS with --audio-opus-passthrough");
                 eprintln!();
                 eprintln!("Examples:");
                 eprintln!("  # Save to file");
                 eprintln!("  whep-client https://example.com/whep > output.mkv");
                 eprintln!();
-                eprintln!("  # Save with Opus passthrough");
-                eprintln!(
-                    "  whep-client --audio-opus-passthrough https://example.com/whep > output.mkv"
-                );
-                eprintln!();
                 eprintln!("  # Play directly with ffplay");
                 eprintln!("  whep-client https://example.com/whep | ffplay -f matroska -i -");
                 eprintln!();
                 eprintln!("  # Verify with ffprobe");
-                eprintln!(
-                    "  whep-client https://example.com/whep > output.mkv && ffprobe output.mkv"
-                );
+                eprintln!("  whep-client https://example.com/whep > output.mkv && ffprobe output.mkv");
                 std::process::exit(0);
             }
             "-d" | "--debug" => {
@@ -79,10 +67,6 @@ fn parse_args() -> AppConfig {
             }
             "-dlibwebrtc" => {
                 debug_libwebrtc = true;
-                i += 1;
-            }
-            "--audio-opus-passthrough" => {
-                audio_opus_passthrough = true;
                 i += 1;
             }
             arg if !arg.starts_with('-') => {
@@ -100,7 +84,6 @@ fn parse_args() -> AppConfig {
         whep_url,
         debug,
         debug_libwebrtc,
-        audio_opus_passthrough,
     }
 }
 
@@ -127,24 +110,15 @@ async fn main() -> Result<()> {
 
     eprintln!("[INFO] Connecting to WHEP endpoint: {}", config.whep_url);
     eprintln!("[INFO] MKV output will be streamed to stdout");
-    if config.audio_opus_passthrough {
-        eprintln!("[INFO] Audio mode: Opus passthrough");
-    } else {
-        eprintln!("[INFO] Audio mode: PCM (decoded)");
-    }
 
-    let audio_output_mode = if config.audio_opus_passthrough {
-        whep::AudioOutputMode::OpusPassthrough
-    } else {
-        whep::AudioOutputMode::PcmS16Le
-    };
-    let mut client = whep::WhepClient::new(&config.whep_url, config.debug, audio_output_mode)?;
+    let mut client = whep::WhepClient::new(&config.whep_url, config.debug)?;
     client.connect().await?;
 
     eprintln!("[INFO] Connected. Receiving frames (Press Ctrl+C to stop)...");
 
     // Run with Ctrl+C and SIGTERM handling
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
         result = async { client.run().await } => {
             if let Err(e) = result {
