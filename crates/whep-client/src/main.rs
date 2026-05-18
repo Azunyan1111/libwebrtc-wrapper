@@ -11,6 +11,8 @@
 //! Audio codec: A_PCM/INT/LIT (PCM S16LE)
 
 mod mkv_writer;
+mod video_scaler;
+mod video_scaler_webrtc;
 mod whep;
 
 use anyhow::Result;

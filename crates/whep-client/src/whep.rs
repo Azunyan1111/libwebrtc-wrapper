@@ -1,6 +1,7 @@
 //! WHEP (WebRTC-HTTP Egress Protocol) client implementation
 
 use crate::mkv_writer::{MkvConfig, MkvWriter};
+use crate::video_scaler::VideoScaler;
 use anyhow::{anyhow, Result};
 use futures::stream::StreamExt;
 use libwebrtc::audio_stream::native::NativeAudioStream;
@@ -30,6 +31,7 @@ pub struct WhepClient {
     // Video/Audio streams
     video_stream: Option<NativeVideoStream>,
     audio_stream: Option<NativeAudioStream>,
+    video_scaler: VideoScaler,
 }
 
 /// Context for frame counting, statistics, and MKV output.
@@ -74,6 +76,7 @@ impl WhepClient {
             debug,
             video_stream: None,
             audio_stream: None,
+            video_scaler: VideoScaler::new(),
         })
     }
 
@@ -497,10 +500,13 @@ impl WhepClient {
 
         // Get I420 buffer
         let i420 = frame.buffer.as_ref().to_i420();
-        let width = i420.width();
-        let height = i420.height();
 
-        let (y_stride, u_stride, v_stride) = i420.strides();
+        let scaled_i420 = self.video_scaler.scale_if_needed(&i420);
+        let output_i420 = scaled_i420.as_ref().unwrap_or(&i420);
+
+        let width = output_i420.width();
+        let height = output_i420.height();
+        let (y_stride, u_stride, v_stride) = output_i420.strides();
 
         // Store metadata and initialize MKV writer on first video frame
         if count == 1 {
@@ -534,7 +540,7 @@ impl WhepClient {
         }
 
         // Get Y, U, V data slices
-        let (y_data, u_data, v_data) = i420.data();
+        let (y_data, u_data, v_data) = output_i420.data();
 
         // Calculate timestamp relative to first frame
         let first_ts = ctx.first_video_timestamp_us.load(Ordering::Relaxed);
